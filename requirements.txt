@@ -16,3 +16,6 @@ pydantic==2.10.3
 
 python-dotenv==1.0.1
 requests==2.34.2
+
+redis==8.0.1          # REDIS_URL (redis:// / rediss://) -- the common shape
+upstash-redis==1.7.0  # KV_REST_API_URL/TOKEN (Upstash's REST API)

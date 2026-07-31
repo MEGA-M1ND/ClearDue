@@ -1,23 +1,29 @@
 """FastAPI wrapper around the ClearDue collections agent.
 
-Session storage is plain in-memory for now, same starting point PaySentry
-had at Stage 1 -- a store.py abstraction (in-memory locally, Redis when
-deployed) is a known later step, not skipped by accident.
+Session/ledger storage goes through agent/store.py: plain in-memory locally,
+Redis-backed (REDIS_URL or Upstash KV) when those env vars are set, same
+switch PaySentry's target_agent/store.py uses. policy_engine's audit log is
+pointed at the same backend at import time below, so a single Redis (or a
+single in-memory process) is the one source of truth for everything a
+Vercel deployment needs to survive across serverless instances.
 """
 
 import os
+import secrets
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from langchain_core.messages import BaseMessage
 from pydantic import BaseModel
 
-from policy_engine.core import list_audit_log, reset_audit_log
+from policy_engine.core import list_audit_log, use_audit_backend
 
 from . import agent as agent_module
 from . import mock_ledger
+from . import store
+
+use_audit_backend(store)
 
 app = FastAPI(title="ClearDue Collections Agent", version="0.1.0")
 
@@ -40,12 +46,6 @@ def ui() -> FileResponse:
     frontend project."""
     return FileResponse(UI_PATH)
 
-SESSIONS: dict[str, list[BaseMessage]] = {}
-# session_id -> the invoice this collections thread is bound to. Pinned on
-# first use, same reasoning as PaySentry's identity pinning: a session
-# cannot be redirected mid-conversation onto a different invoice.
-SESSION_INVOICE: dict[str, str] = {}
-
 
 class ChatRequest(BaseModel):
     message: str
@@ -63,12 +63,12 @@ class ChatResponse(BaseModel):
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
     if req.session_id:
-        history = SESSIONS.get(req.session_id, [])
-        if req.invoice_id and req.session_id not in SESSION_INVOICE:
-            SESSION_INVOICE[req.session_id] = req.invoice_id.strip().upper()
-        bound_invoice = SESSION_INVOICE.get(req.session_id)
+        history = store.get_history(req.session_id)
+        bound_invoice = store.get_bound_invoice(req.session_id)
+        if req.invoice_id and not bound_invoice:
+            bound_invoice = store.bind_invoice(req.session_id, req.invoice_id.strip().upper())
         result = agent_module.run_turn(history, req.message, bound_invoice)
-        SESSIONS[req.session_id] = result["messages"]
+        store.set_history(req.session_id, result["messages"])
     else:
         result = agent_module.run_turn([], req.message, req.invoice_id)
     return ChatResponse(response=result["response"], tool_calls=result["tool_calls"])
@@ -80,18 +80,34 @@ def health() -> dict[str, Any]:
     model = os.getenv("OPENAI_MODEL", agent_module.DEFAULT_OPENAI_MODEL)
     return {
         "status": "ok",
-        "sessions": len(SESSIONS),
+        "sessions": store.session_count(),
         "provider": provider,
         "model": model,
         "guardrails": "on" if agent_module.GUARDRAILS_ENABLED else "off",
         "authz": "on" if agent_module.AUTHZ_ENABLED else "off",
+        "storage": "redis" if store.USING_KV else "memory",
     }
 
 
 # ---------------------------------------------------------------------------
 # Debug/introspection -- ground truth for the adversary suite, same role as
 # PaySentry's /debug endpoints. Not part of the simulated product surface.
+#
+# Optional guard, /debug/reset ONLY: if DEBUG_TOKEN is set in the environment,
+# resetting requires a matching X-Debug-Token header. Unset (the default, and
+# always the case for local dev) means fully open, exactly as every prior
+# phase of this project. The read-only /debug/* endpoints stay open even
+# when DEBUG_TOKEN is set -- the demo UI depends on them. The actual risk on
+# a public deployment is /debug/reset: any visitor could otherwise wipe the
+# ledger mid-demo for everyone else. That's what this protects.
 # ---------------------------------------------------------------------------
+
+_DEBUG_TOKEN = os.getenv("DEBUG_TOKEN")
+
+
+def _check_debug_token(x_debug_token: str | None) -> None:
+    if _DEBUG_TOKEN and not (x_debug_token and secrets.compare_digest(x_debug_token, _DEBUG_TOKEN)):
+        raise HTTPException(status_code=401, detail="missing or incorrect X-Debug-Token")
 
 
 @app.get("/debug/action_log")
@@ -127,11 +143,9 @@ def debug_policy_log() -> dict[str, Any]:
 
 
 @app.post("/debug/reset")
-def debug_reset() -> dict[str, Any]:
-    mock_ledger.reset()
-    reset_audit_log()
-    SESSIONS.clear()
-    SESSION_INVOICE.clear()
+def debug_reset(x_debug_token: str | None = Header(default=None)) -> dict[str, Any]:
+    _check_debug_token(x_debug_token)
+    mock_ledger.reset()  # clears action_log, audit_log, session history, and bindings via store.reset()
     # Undo any in-memory ledger mutations from mark_paid/revoke_consent so
     # each run starts from the same known state.
     for inv in mock_ledger.INVOICES.values():

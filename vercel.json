@@ -1,0 +1,14 @@
+{
+  "rewrites": [
+    { "source": "/chat", "destination": "/api/index" },
+    { "source": "/health", "destination": "/api/index" },
+    { "source": "/debug/action_log", "destination": "/api/index" },
+    { "source": "/debug/ledger", "destination": "/api/index" },
+    { "source": "/debug/policy", "destination": "/api/index" },
+    { "source": "/debug/policy_log", "destination": "/api/index" },
+    { "source": "/debug/reset", "destination": "/api/index" }
+  ],
+  "functions": {
+    "api/index.py": { "maxDuration": 60 }
+  }
+}

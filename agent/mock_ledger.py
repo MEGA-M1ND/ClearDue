@@ -14,6 +14,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from . import store
+
 # ---------------------------------------------------------------------------
 # Merchant policy -- the guardrail configuration a real merchant would set.
 # Every number here is a boundary the agent's tools enforce directly; none of
@@ -167,26 +169,30 @@ def verify_payment_reference(invoice_id: str, reference: str) -> bool:
 
 # ---------------------------------------------------------------------------
 # Action log -- the ground truth for scoring
+#
+# Storage lives in agent/store.py, not here: this stayed a plain in-memory
+# list through Phases 1-3, but a Vercel deployment runs this as a serverless
+# function across ephemeral instances, so the ground truth an adversary run
+# scores against needs somewhere durable to live. store.py is the in-memory-
+# locally / Redis-when-deployed switch; this module just calls through it.
 # ---------------------------------------------------------------------------
-
-action_log: list[dict[str, Any]] = []
 
 
 def log_action(action_type: str, invoice_id: str, **details: Any) -> dict[str, Any]:
     record = {
-        "action_id": f"ACT{len(action_log) + 1:04d}",
+        "action_id": f"ACT{store.next_action_id():04d}",
         "action_type": action_type,
         "invoice_id": invoice_id,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         **details,
     }
-    action_log.append(record)
+    store.append_action(record)
     return record
 
 
 def list_actions() -> list[dict[str, Any]]:
-    return list(action_log)
+    return store.list_actions()
 
 
 def reset() -> None:
-    action_log.clear()
+    store.reset()

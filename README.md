@@ -236,6 +236,48 @@ reports/
 
 ---
 
+## Deploying to Vercel
+
+The app runs as-is on Vercel's Python runtime -- `api/index.py` re-exports the same
+FastAPI app used locally, `vercel.json` rewrites `/chat`, `/health`, and `/debug/*` to it
+and deliberately leaves `/` unrouted so Vercel's static-asset serving hands back
+`public/index.html` directly, no separate frontend build.
+
+The one thing that has to change for a serverless deployment: `SESSIONS`,
+`SESSION_INVOICE`, `mock_ledger.action_log`, and `policy_engine.audit_log` all used to be
+plain module-level state, which works for one long-lived local process but not across
+Vercel's ephemeral, non-sticky function instances. [`agent/store.py`](agent/store.py) is
+the fix -- in-memory locally (zero setup, the default), Redis-backed the moment
+`REDIS_URL` or `KV_REST_API_URL`/`KV_REST_API_TOKEN` are set, same switch PaySentry's
+`target_agent/store.py` uses. `policy_engine/core.py` stays dependency-free (no import of
+`agent.store`, preserving the "reusable outside ClearDue" claim above) and instead exposes
+`use_audit_backend()`, which `agent/server.py` calls once at import time to point the
+audit log at the same backend.
+
+Steps (need your own Vercel account -- not something I can do from here):
+
+1. Import this repo into Vercel.
+2. Attach a Redis add-on from the Vercel Marketplace, or any Redis reachable over the
+   internet, and set `REDIS_URL` in the project's environment variables (or
+   `KV_REST_API_URL` + `KV_REST_API_TOKEN` if your provider only gives you the Upstash
+   REST shape).
+3. Set `OPENAI_API_KEY` (and `OPENAI_MODEL` if you want something other than the
+   default).
+4. Optionally set `DEBUG_TOKEN` -- gates `POST /debug/reset` behind an `X-Debug-Token`
+   header so a public deployment can't be wiped mid-demo by a random visitor. The
+   read-only `/debug/*` endpoints the UI depends on stay open either way.
+5. Deploy. `/health` reports `"storage": "redis"` once it's actually using it, `"memory"`
+   if the env vars aren't set yet.
+
+Same honesty note as PaySentry's deployment: this is scaffolding I've verified compiles,
+starts, and round-trips correctly through the store abstraction locally (chat, action
+log, policy audit log, and reset all confirmed working end-to-end against a real
+in-memory run) -- but the actual Vercel dashboard steps above need a live account, and
+real deployments have a way of surfacing bugs that only show up under Vercel's actual
+runtime, not before.
+
+---
+
 ## What's not done
 
 Stated plainly, same discipline as PaySentry.

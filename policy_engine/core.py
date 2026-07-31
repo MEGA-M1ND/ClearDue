@@ -73,24 +73,43 @@ class Policy(Protocol):
 # audit trail" -- a trail that shows only what succeeded is not full. A
 # merchant reviewing this agent should be able to see every attempt a policy
 # blocked and why, not just the ones that got through.
+#
+# Storage is pluggable (`use_audit_backend`) rather than hard-wired to a
+# Redis client, so this module keeps zero required dependencies beyond the
+# standard library -- staying genuinely reusable by a different agent, not
+# just ClearDue-shaped. Defaults to a plain in-memory list; ClearDue points
+# it at agent/store.py (Redis-backed when deployed) at startup.
 # ---------------------------------------------------------------------------
 
 audit_log: list[dict[str, Any]] = []
+_audit_backend: Any = None
+
+
+def use_audit_backend(backend: Any) -> None:
+    """Redirect the audit log to an external backend exposing
+    append_audit(record) and list_audit() -> list[dict]. Optional -- call
+    site's responsibility to also handle resetting that backend."""
+    global _audit_backend
+    _audit_backend = backend
 
 
 def _record(tool_name: str, call_args: dict, result: PolicyResult, policy_name: str) -> None:
-    audit_log.append(
-        {
-            "tool": tool_name,
-            "args": {k: v for k, v in call_args.items() if k != "state"},
-            "policy": policy_name,
-            "allowed": result.allowed,
-            "reason": result.reason,
-        }
-    )
+    entry = {
+        "tool": tool_name,
+        "args": {k: v for k, v in call_args.items() if k != "state"},
+        "policy": policy_name,
+        "allowed": result.allowed,
+        "reason": result.reason,
+    }
+    if _audit_backend is not None:
+        _audit_backend.append_audit(entry)
+    else:
+        audit_log.append(entry)
 
 
 def list_audit_log() -> list[dict[str, Any]]:
+    if _audit_backend is not None:
+        return _audit_backend.list_audit()
     return list(audit_log)
 
 
