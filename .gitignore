@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+
+reports/*.json
+reports/*.html
+reports/*.jsonl
+!reports/.gitkeep
+
+.vercel/
