@@ -12,7 +12,7 @@ import os
 import secrets
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -21,6 +21,7 @@ from policy_engine.core import list_audit_log, use_audit_backend
 
 from . import agent as agent_module
 from . import mock_ledger
+from . import rate_limit
 from . import store
 
 use_audit_backend(store)
@@ -60,8 +61,24 @@ class ChatResponse(BaseModel):
     tool_calls: list[dict[str, Any]]
 
 
+def _client_ip(request: Request) -> str:
+    # Vercel (and any proxy in front of this app) puts the real client IP
+    # first in X-Forwarded-For; request.client.host would otherwise just be
+    # the proxy's own address. Falls back to that for local dev, where
+    # there's no proxy and the header is absent.
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest) -> ChatResponse:
+def chat(req: ChatRequest, request: Request) -> ChatResponse:
+    try:
+        rate_limit.check_chat_rate_limit(_client_ip(request))
+    except rate_limit.RateLimitExceeded as e:
+        raise HTTPException(status_code=429, detail=str(e), headers={"Retry-After": str(e.retry_after)})
+
     if req.session_id:
         history = store.get_history(req.session_id)
         bound_invoice = store.get_bound_invoice(req.session_id)

@@ -272,7 +272,10 @@ Steps (need your own Vercel account -- not something I can do from here):
 4. Optionally set `DEBUG_TOKEN` -- gates `POST /debug/reset` behind an `X-Debug-Token`
    header so a public deployment can't be wiped mid-demo by a random visitor. The
    read-only `/debug/*` endpoints the UI depends on stay open either way.
-5. Deploy. `/health` reports `"storage": "redis"` once it's actually using it, `"memory"`
+5. `/chat` is rate-limited by default (20 requests / 5 min per IP, 300/day shared cap --
+   [`agent/rate_limit.py`](agent/rate_limit.py), tunable via `RATE_LIMIT_*` env vars) since
+   this puts a real OpenAI key behind a public link with no login.
+6. Deploy. `/health` reports `"storage": "redis"` once it's actually using it, `"memory"`
    if the env vars aren't set yet.
 
 Same honesty note as PaySentry's deployment: this is scaffolding I've verified compiles,

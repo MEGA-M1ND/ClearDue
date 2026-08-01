@@ -46,6 +46,8 @@ class _MemoryBackend:
         self.bindings: dict[str, str] = {}
         self.actions: list[dict[str, Any]] = []
         self.audit: list[dict[str, Any]] = []
+        # (count, expires_at_epoch_seconds) per rate-limit key.
+        self.rate_counters: dict[str, tuple[int, float]] = {}
 
     def get_history(self, session_id: str) -> list[BaseMessage]:
         return list(self.sessions.get(session_id, []))
@@ -77,6 +79,17 @@ class _MemoryBackend:
     def list_audit(self) -> list[dict[str, Any]]:
         return list(self.audit)
 
+    def incr_with_ttl(self, key: str, ttl_seconds: int) -> tuple[int, int]:
+        import time
+
+        now = time.time()
+        count, expires_at = self.rate_counters.get(key, (0, 0.0))
+        if now >= expires_at:
+            count, expires_at = 0, now + ttl_seconds
+        count += 1
+        self.rate_counters[key] = (count, expires_at)
+        return count, max(0, int(expires_at - now))
+
     def reset(self) -> None:
         self.sessions.clear()
         self.bindings.clear()
@@ -87,9 +100,9 @@ class _MemoryBackend:
 class _RedisBackedStore:
     """Shared logic for any client exposing the standard Redis command names.
 
-    Both connection shapes below expose an identical surface for the six
-    commands used here (get/set/rpush/lrange/incr/keys/delete), so the
-    storage logic lives here once; each subclass only builds the client.
+    Both connection shapes below expose an identical surface for the seven
+    commands used here (get/set/rpush/lrange/incr/expire/ttl/keys/delete), so
+    the storage logic lives here once; each subclass only builds the client.
     """
 
     def __init__(self, client: Any) -> None:
@@ -139,6 +152,17 @@ class _RedisBackedStore:
 
     def list_audit(self) -> list[dict[str, Any]]:
         return [json.loads(r) for r in self._redis.lrange(_AUDIT_LOG_KEY, 0, -1)]
+
+    def incr_with_ttl(self, key: str, ttl_seconds: int) -> tuple[int, int]:
+        # INCR is atomic across every serverless instance sharing this Redis,
+        # which a per-process in-memory counter could never be. EXPIRE is set
+        # only on the count's first increment (count == 1) so the window
+        # doesn't keep sliding forward on every request within it.
+        count = int(self._redis.incr(key))
+        if count == 1:
+            self._redis.expire(key, ttl_seconds)
+        ttl = self._redis.ttl(key)
+        return count, ttl if ttl and ttl > 0 else ttl_seconds
 
     def reset(self) -> None:
         keys = self._redis.keys("cleardue:history:*") + self._redis.keys("cleardue:binding:*")
@@ -214,6 +238,15 @@ def append_audit(record: dict[str, Any]) -> None:
 
 def list_audit() -> list[dict[str, Any]]:
     return _backend.list_audit()
+
+
+def incr_with_ttl(key: str, ttl_seconds: int) -> tuple[int, int]:
+    """Increment a fixed-window counter, returning (new_count, seconds_left).
+
+    Used by rate_limit.py. Deliberately not touched by reset() below --
+    clearing demo state shouldn't also reset abuse-protection counters.
+    """
+    return _backend.incr_with_ttl(key, ttl_seconds)
 
 
 def reset() -> None:
