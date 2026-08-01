@@ -426,10 +426,30 @@ _agent = None
 
 
 def get_agent():
+    """Build the agent, extending it with gateway-guarded MCP tools if enabled.
+
+    The MCP tools are appended rather than substituted: the native tools own
+    ClearDue's own domain (negotiation, consent, escalation) and the MCP
+    tools own the Razorpay rail. Both paths run through the same
+    policy_engine and write to the same audit log, so enabling MCP widens
+    what the agent can do without opening a second, unguarded route to it.
+    """
     global _agent
     if _agent is None:
+        from . import mcp_runtime
+
+        tools = list(TOOLS) + mcp_runtime.tools()
+        prompt = SYSTEM_PROMPT
+        if mcp_runtime.tools():
+            prompt += (
+                "\n\nYou also have Razorpay tools available for the live payment rail. "
+                "Their amounts are in paise (multiply rupees by 100). Every one of "
+                "them passes through a policy gateway before it executes; if a call is "
+                "blocked, explain the limit to the customer rather than retrying it a "
+                "different way."
+            )
         _agent = create_react_agent(
-            _build_llm(), TOOLS, prompt=SYSTEM_PROMPT, state_schema=ClearDueState
+            _build_llm(), tools, prompt=prompt, state_schema=ClearDueState
         )
     return _agent
 

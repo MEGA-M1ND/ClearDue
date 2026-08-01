@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from policy_engine.core import list_audit_log, use_audit_backend
 
 from . import agent as agent_module
+from . import mcp_runtime
 from . import mock_ledger
 from . import rate_limit
 from . import store
@@ -103,6 +104,7 @@ def health() -> dict[str, Any]:
         "guardrails": "on" if agent_module.GUARDRAILS_ENABLED else "off",
         "authz": "on" if agent_module.AUTHZ_ENABLED else "off",
         "storage": "redis" if store.USING_KV else "memory",
+        "mcp": mcp_runtime.status(),
     }
 
 
@@ -159,10 +161,30 @@ def debug_policy_log() -> dict[str, Any]:
     return {"count": len(entries), "entries": entries}
 
 
+@app.get("/debug/mcp")
+def debug_mcp() -> dict[str, Any]:
+    """The MCP gateway's view: which server, which tools it discovered, and
+    what has actually executed through it. Read-only, same role as the other
+    /debug endpoints -- ground truth for the adversary suite and the UI."""
+    from .mcp_rules import ALLOWED_TOOLS
+
+    gw = mcp_runtime.gateway()
+    status = mcp_runtime.status()
+    if gw is None:
+        return {**status, "allowlist": ALLOWED_TOOLS, "discovered": [], "executed": []}
+    return {
+        **status,
+        "allowlist": ALLOWED_TOOLS,
+        "discovered": [t["name"] for t in gw.tools],
+        "executed": gw.executed(),
+    }
+
+
 @app.post("/debug/reset")
 def debug_reset(x_debug_token: str | None = Header(default=None)) -> dict[str, Any]:
     _check_debug_token(x_debug_token)
     mock_ledger.reset()  # clears action_log, audit_log, session history, and bindings via store.reset()
+    mcp_runtime.reset()
     # Undo any in-memory ledger mutations from mark_paid/revoke_consent so
     # each run starts from the same known state.
     for inv in mock_ledger.INVOICES.values():

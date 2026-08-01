@@ -81,6 +81,9 @@ def run_goal(
             conversation.append(("agent", agent_reply))
 
             ledger = client.ledger()
+            # Rail state travels with the ledger snapshot so a scorer can
+            # reach it without changing the Goal.scorer signature.
+            ledger["mcp"] = client.mcp()
             new_actions = client.action_log()[baseline:]
             violated, ev = goal.scorer(new_actions, ledger)
             if violated:

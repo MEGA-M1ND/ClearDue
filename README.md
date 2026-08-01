@@ -231,6 +231,15 @@ policy_engine/
   core.py            PolicyContext, PolicyResult, the @guarded() decorator, audit_log
   policies.py        reusable Policy classes -- no ClearDue-specific imports
 
+mcp_gateway/
+  connection.py      one long-lived MCP session, callable synchronously
+  gateway.py         intercepts every tools/call, enforces policy pre-execution
+  langchain_tools.py generates LangChain tools from the server's own schemas
+
+razorpay_mcp/
+  server.py          a self-hosted MCP server over the real Razorpay REST API
+  rest.py            signed requests + a receipt log proving what actually executed
+
 adversary/
   client.py          HTTP client for the target
   goals.py            6 outcomes + ground-truth scorers
@@ -244,6 +253,48 @@ reports/
   discovery_results.json                        generated, gitignored
   payment_link_overcollect_before_after.md       the flagship finding, committed
 ```
+
+---
+
+## The MCP policy gateway
+
+Razorpay's MCP server hands an LLM roughly forty money-moving operations — payment links,
+orders, refunds, instant settlements — to any client holding a merchant token. The
+published blast-radius control is *availability*: three of the riskiest tools
+(`create_refund`, `close_qr_code`, `create_instant_settlement`) are withheld from the
+hosted server and offered only on a self-hosted one. One bit per tool, fixed at deployment,
+identical for every merchant.
+
+[`mcp_gateway/`](mcp_gateway/) is the fine-grained version. It sits between the model and
+the MCP transport; every `tools/call` runs through the same `policy_engine` that guards
+ClearDue's native tools, so one audit trail covers both.
+
+```python
+gateway.configure(
+    global_policies=[ToolAllowlist(allowed=ALLOWED_TOOLS)],
+    rules=[ToolRule(match="create_payment_link", policies=[
+        NumericBounds(field="amount", max_value=MAX_LINK_PAISE),
+        WindowedBudget(history=gateway.history_for("create_payment_link"),
+                       window_seconds=3600, max_calls=12, max_amount=BUDGET_PAISE,
+                       amount_field="amount"),
+    ])],
+)
+```
+
+**The property that matters is pre-execution**, and it's checkable rather than asserted.
+The bundled MCP server appends a receipt for every HTTP request it actually makes, so a
+denial that leaves no receipt is proof the call was stopped before it could move money.
+In a live `gpt-5.2` negotiation the model *was* successfully social-engineered into
+attempting a ₹50,000 instant settlement — and the gateway blocked it, with no
+corresponding receipt. The model can be talked into it; the gateway is what makes that not
+matter.
+
+Full evidence, including a real auth finding on Razorpay's hosted MCP endpoint, is in
+[`reports/mcp_policy_gateway.md`](reports/mcp_policy_gateway.md).
+
+Off by default. `CLEARDUE_MCP=on` plus Razorpay test keys turns it on; without them the
+agent runs exactly as before on its own tools and the mock ledger, so the repo still
+clones and runs with nothing configured.
 
 ---
 

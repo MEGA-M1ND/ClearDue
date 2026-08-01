@@ -10,6 +10,7 @@ ClearDue exists.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable
 
 from .core import Policy, PolicyContext, PolicyResult
@@ -335,4 +336,97 @@ class NumericBounds(Policy):
                 f"{self._field} of {value} exceeds the maximum of {self._max_value}.",
                 error_code="out_of_bounds",
             )
+        return PolicyResult.allow()
+
+
+class ToolAllowlist(Policy):
+    """The tool being invoked must be on an explicit allowlist.
+
+    Written for enforcement points that face a tool catalog the agent's
+    author did not choose -- an MCP server, for instance, hands over whatever
+    tools it happens to expose, and that set can grow on the server's release
+    schedule rather than yours. Denying by default means a newly-added
+    money-moving tool is unreachable until somebody opts into it, instead of
+    silently becoming available to the model.
+    """
+
+    name = "ToolAllowlist"
+
+    def __init__(self, allowed: list[str], enabled: Callable[[], bool] = lambda: True):
+        self._allowed = set(allowed)
+        self._enabled = enabled
+
+    def check(self, ctx: PolicyContext) -> PolicyResult:
+        if not self._enabled():
+            return PolicyResult.allow()
+        if ctx.tool_name not in self._allowed:
+            return PolicyResult.deny(
+                f"{ctx.tool_name!r} is not on this agent's allowlist. Allowed: "
+                + ", ".join(sorted(self._allowed))
+                + ".",
+                error_code="tool_not_allowed",
+            )
+        return PolicyResult.allow()
+
+
+class WindowedBudget(Policy):
+    """A rolling-window ceiling on how much an agent may do, in call count
+    and/or in summed value.
+
+    Distinct from CumulativeCap, which bounds a total against one record's
+    own limit (this invoice, this block). This bounds an agent's activity
+    per unit time regardless of which record it touches -- the control that
+    answers "what is the worst case if this agent is compromised, or simply
+    wrong, for an hour?"
+
+    `history` returns recent executed calls as {"ts": float, "amount": float}
+    so storage stays the caller's problem and this class keeps no state of
+    its own -- the same dependency-injection shape every other policy here
+    uses.
+    """
+
+    name = "WindowedBudget"
+
+    def __init__(
+        self,
+        history: Callable[[], list[dict]],
+        window_seconds: float,
+        max_calls: int | None = None,
+        max_amount: float | None = None,
+        amount_field: str | None = None,
+        enabled: Callable[[], bool] = lambda: True,
+    ):
+        self._history = history
+        self._window = window_seconds
+        self._max_calls = max_calls
+        self._max_amount = max_amount
+        self._amount_field = amount_field
+        self._enabled = enabled
+
+    def check(self, ctx: PolicyContext) -> PolicyResult:
+        if not self._enabled():
+            return PolicyResult.allow()
+
+        cutoff = time.time() - self._window
+        recent = [h for h in self._history() if h.get("ts", 0) >= cutoff]
+        mins = self._window / 60
+
+        if self._max_calls is not None and len(recent) + 1 > self._max_calls:
+            return PolicyResult.deny(
+                f"this would be call {len(recent) + 1} in {mins:.0f} minutes, over the "
+                f"limit of {self._max_calls}.",
+                error_code="budget_exceeded",
+            )
+
+        if self._max_amount is not None and self._amount_field:
+            requested = ctx.args.get(self._amount_field, 0) or 0
+            spent = sum(h.get("amount", 0) or 0 for h in recent)
+            if spent + requested > self._max_amount:
+                return PolicyResult.deny(
+                    f"{requested:,.0f} would bring the {mins:.0f}-minute total to "
+                    f"{spent + requested:,.0f} ({spent:,.0f} already committed), over the "
+                    f"budget of {self._max_amount:,.0f}.",
+                    error_code="budget_exceeded",
+                )
+
         return PolicyResult.allow()

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
@@ -100,11 +101,22 @@ def _record(tool_name: str, call_args: dict, result: PolicyResult, policy_name: 
         "policy": policy_name,
         "allowed": result.allowed,
         "reason": result.reason,
+        "ts": time.time(),
     }
     if _audit_backend is not None:
         _audit_backend.append_audit(entry)
     else:
         audit_log.append(entry)
+
+
+def record_decision(
+    tool_name: str, call_args: dict, result: PolicyResult, policy_name: str
+) -> None:
+    """Public entry point for enforcement points that are not the guarded()
+    decorator -- notably mcp_gateway, which intercepts MCP `tools/call`
+    rather than wrapping a Python function. Same audit log either way, so a
+    reviewer sees one trail regardless of which layer made the decision."""
+    _record(tool_name, call_args, result, policy_name)
 
 
 def list_audit_log() -> list[dict[str, Any]]:

@@ -19,3 +19,9 @@ requests==2.34.2
 
 redis==8.0.1          # REDIS_URL (redis:// / rediss://) -- the common shape
 upstash-redis==1.7.0  # KV_REST_API_URL/TOKEN (Upstash's REST API)
+
+# MCP client + server, for mcp_gateway/ and razorpay_mcp/.
+# Pinned below 2.0 deliberately: mcp 2.x requires starlette >=1.0, which is
+# incompatible with the fastapi 0.115.5 pinned above. 1.29 works with both.
+mcp==1.29.0
+starlette==0.41.3

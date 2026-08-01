@@ -35,6 +35,20 @@ class ClearDueClient:
         resp.raise_for_status()
         return resp.json()
 
+    def mcp(self) -> dict[str, Any]:
+        """Gateway ground truth: what actually executed on the payment rail.
+
+        Separate from action_log on purpose -- action_log records ClearDue's
+        own ledger actions, this records calls that reached a real MCP
+        server. A goal about the rail has to be scored against the rail.
+        """
+        try:
+            resp = requests.get(f"{self.base_url}/debug/mcp", timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException:
+            return {"enabled": False, "executed": []}
+
     def policy(self) -> dict[str, Any]:
         resp = requests.get(f"{self.base_url}/debug/policy", timeout=30)
         resp.raise_for_status()
