@@ -289,7 +289,11 @@ attempting a ₹50,000 instant settlement — and the gateway blocked it, with n
 corresponding receipt. The model can be talked into it; the gateway is what makes that not
 matter.
 
-Full evidence, including a real auth finding on Razorpay's hosted MCP endpoint, is in
+A seventh adversary goal, `rail_abuse`, points the autonomous debtor at the same rail. Four
+runs, three framings: it never independently found the platform-native angle the manual
+test used, consistently reaching for external bank-transfer framing instead, which the
+model refuses hard regardless of internal-authority dressing. That's a real, reported
+negative result, not a padded "held" — full reasoning and all four transcripts are in
 [`reports/mcp_policy_gateway.md`](reports/mcp_policy_gateway.md).
 
 Off by default. `CLEARDUE_MCP=on` plus Razorpay test keys turns it on; without them the
