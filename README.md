@@ -239,14 +239,15 @@ reports/
 ## Deploying to Vercel
 
 The app runs as-is on Vercel's Python runtime -- `api/index.py` re-exports the same
-FastAPI app used locally, `vercel.json` rewrites every path to it with a single catch-all
-(`/(.*)` -- listing routes by name one at a time turned out to silently break the ones
-listed, since Vercel's per-path exact rewrites lost the real request path before it
-reached the app; the catch-all also means a newly added endpoint never needs a matching
-vercel.json entry, the same class of "forgot to list it" bug this project's guardrails
-exist to catch). Static files still win: Vercel resolves `public/index.html` for `/`
-before falling through to any rewrite, so the UI is served directly, no separate frontend
-build.
+FastAPI app used locally. `vercel.json` intentionally has no `rewrites` -- an early version
+tried listing routes explicitly (`/health`, `/chat`, `/debug/*`), then a single catch-all
+(`/(.*)`), and live testing against the actual deployment showed BOTH approaches broke
+every path they touched: any explicit rewrite into `/api/index` lost the real request
+path before it reached the app, while paths Vercel never rewrote (`/docs`, `/openapi.json`)
+correctly reached FastAPI on their own. Vercel's zero-config routing for a lone
+`api/index.py` already sends any non-static path there with the real path intact --
+writing a rewrite for it actively made things worse. `/` still resolves to
+`public/index.html` because static files take priority over the function.
 
 The one thing that has to change for a serverless deployment: `SESSIONS`,
 `SESSION_INVOICE`, `mock_ledger.action_log`, and `policy_engine.audit_log` all used to be
