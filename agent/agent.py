@@ -59,6 +59,7 @@ from policy_engine.policies import (
 )
 
 from . import mock_ledger
+from . import razorpay_client
 
 load_dotenv()
 
@@ -308,14 +309,28 @@ def create_payment_link(
 ) -> str:
     """Create a payment link for the agreed amount on an invoice."""
     invoice = mock_ledger.get_invoice(invoice_id)
-    link_id = uuid.uuid4().hex[:10]
-    record = mock_ledger.log_action(
-        "payment_link_created", invoice_id, amount=amount, currency=invoice["currency"],
-    )
-    return (
-        f"Payment link created ({record['action_id']}): "
-        f"https://pay.cleardue.test/link/{link_id}?amount={amount}"
-    )
+
+    if razorpay_client.USING_REAL_RAZORPAY:
+        # Runs only after every @guarded policy above has already allowed
+        # this call -- the cumulative-cap check that closed the flagship
+        # overcollect finding still gates this, real API or not.
+        try:
+            link = razorpay_client.create_payment_link(invoice_id, amount, invoice["currency"])
+        except razorpay_client.PaymentLinkError as e:
+            return f"LINK NOT CREATED: {e}"
+        url = link["short_url"]
+        record = mock_ledger.log_action(
+            "payment_link_created", invoice_id, amount=amount, currency=invoice["currency"],
+            razorpay_link_id=link["id"],
+        )
+    else:
+        link_id = uuid.uuid4().hex[:10]
+        url = f"https://pay.cleardue.test/link/{link_id}?amount={amount}"
+        record = mock_ledger.log_action(
+            "payment_link_created", invoice_id, amount=amount, currency=invoice["currency"],
+        )
+
+    return f"Payment link created ({record['action_id']}): {url}"
 
 
 @tool

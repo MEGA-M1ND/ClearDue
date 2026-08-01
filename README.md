@@ -48,6 +48,17 @@ for it. Six synthetic invoices, five synthetic customers, one merchant policy (m
 autonomous discount, max 2 installments, ₹500,000 escalation threshold). No real money,
 no real customers — see [Safety](#safety).
 
+**Payment links are real.** Set `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` (test-mode keys)
+and `create_payment_link` calls Razorpay's actual Payment Links API, returning a real
+`rzp.io` URL, with the Razorpay link id recorded in the action log alongside the amount.
+Unset, it falls back to a `pay.cleardue.test` mock so the repo runs for anyone cloning it
+without credentials. The guardrails run *before* the API call either way — a request that
+would breach the cumulative cap is rejected without ever reaching Razorpay. No customer
+contact details are sent (the customers are synthetic; asking Razorpay to notify them
+would mean trying to reach people who don't exist), so only amount, currency, and an
+invoice-referencing description leave this process. See
+[`agent/razorpay_client.py`](agent/razorpay_client.py).
+
 Unlike PaySentry, guardrails were designed in from the start, not retrofitted after a
 red-team run found a gap. That changed what was worth building: instead of a single
 before/after story, this project has three layers, each proven against the last.
@@ -275,7 +286,9 @@ Steps (need your own Vercel account -- not something I can do from here):
 5. `/chat` is rate-limited by default (20 requests / 5 min per IP, 300/day shared cap --
    [`agent/rate_limit.py`](agent/rate_limit.py), tunable via `RATE_LIMIT_*` env vars) since
    this puts a real OpenAI key behind a public link with no login.
-6. Deploy. `/health` reports `"storage": "redis"` once it's actually using it, `"memory"`
+6. Optionally set `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET` (test-mode keys) to create
+   real Razorpay payment links instead of mock ones.
+7. Deploy. `/health` reports `"storage": "redis"` once it's actually using it, `"memory"`
    if the env vars aren't set yet.
 
 Same honesty note as PaySentry's deployment: this is scaffolding I've verified compiles,
@@ -300,16 +313,26 @@ Stated plainly, same discipline as PaySentry.
   invoice aren't reconciled against each other -- both individually respect their own
   cap, but nothing currently checks whether their combined effect exceeds what the
   invoice's actual concession budget should be.
-- **No UI framework, no deployment yet** at the time of writing this section -- see the
-  repo's commit history for whether that's since changed.
-- **Rate limiting is out of scope**, same as PaySentry's LLM10 finding. This project is
-  about the negotiation and guardrail layer, not infrastructure-level abuse protection.
+- **Only `create_payment_link` talks to a real API.** The rest of the ledger is still
+  synthetic -- `mark_paid` verifies against a hardcoded reference list, not a real bank
+  feed or Razorpay's payment status, so a link being genuinely paid in test mode wouldn't
+  currently close the invoice on its own.
+- **One hardcoded merchant policy**, not a per-merchant config system. Every number in
+  `MERCHANT_POLICY` applies globally; a real product would need these per merchant, and
+  the policy engine would need to load them per request rather than at import.
+- **Rate limiting is deliberately blunt** -- a fixed-window per-IP counter plus a global
+  daily cap, enough to bound spend on a public demo link, not real abuse protection.
 
 ---
 
 ## Safety
 
-Entirely synthetic. Six fake invoices in an in-memory dict, five fake customers, fake
-payment links on a `.test` domain, an in-memory action log. **No real merchants, no real
-customers, no real payment credentials, no real financial systems.** The autonomous
-debtor negotiates against a mock agent built for exactly this purpose.
+The ledger is entirely synthetic: six fake invoices in memory, five fake customers with
+no real contact details, an in-memory action log. **No real merchants, no real customers,
+no real customer data.** The autonomous debtor negotiates against an agent built for
+exactly this purpose.
+
+The one real external call is Razorpay's Payment Links API, in **test mode** (`rzp_test_`
+keys) -- links are real URLs but no real money can move through them. No customer contact
+details are ever sent, so Razorpay is never asked to notify anyone. Guardrails run before
+the call, not after, so a policy-violating request never reaches the API at all.

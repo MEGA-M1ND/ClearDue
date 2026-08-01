@@ -11,3 +11,4 @@ reports/*.jsonl
 !reports/.gitkeep
 
 .vercel/
+razorpay_writeup.md
