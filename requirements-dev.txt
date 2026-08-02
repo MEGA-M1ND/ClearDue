@@ -1,0 +1,10 @@
+# Dev-only, on top of requirements.txt. Deliberately kept out of the
+# manifest Vercel builds from -- this project already had one real
+# incident this session where an unrelated dependency's own pin (mcp's
+# pydantic>=2.11.0 requirement) broke the deployed build. pytest has no
+# runtime role at all, so it has no business anywhere near that manifest.
+#
+# Install with:
+#   pip install -r requirements.txt -r requirements-dev.txt
+
+pytest==8.3.4

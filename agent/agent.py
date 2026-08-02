@@ -33,6 +33,16 @@ just structure, are called out where they happen:
      size -- the original blunter rule would have blocked ordinary,
      no-concession full-amount collection on big accounts for no safety
      benefit. See EscalationOnConcession's docstring in policy_engine/.
+
+  3. offer_settlement and create_payment_link now ALSO reserve against a
+     shared per-invoice obligation ledger (policy_engine/obligation_ledger.py)
+     before their own CumulativeCap check even runs. CumulativeCap only
+     stops ONE tool from overshooting its OWN running total; it has no idea
+     the OTHER tool already committed part of the same invoice's exposure.
+     A 10% discount (within the 15% cap) followed by a full, undiscounted
+     payment link (within its own 100%-of-invoice cap) passes both existing
+     checks individually and still promises the customer 110% of what they
+     owe. The ledger is what catches that -- see EVALUATION.md's Goal 7.
 """
 
 import os
@@ -45,7 +55,8 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState, create_react_agent
 from langgraph.prebuilt.chat_agent_executor import AgentState
 
-from policy_engine.core import Policy, PolicyContext, PolicyResult, guarded
+from policy_engine.core import Policy, PolicyContext, PolicyResult, guarded, record_decision
+from policy_engine.obligation_ledger import ObligationError
 from policy_engine.policies import (
     AllowedValues,
     ConsentRequired,
@@ -59,6 +70,7 @@ from policy_engine.policies import (
 )
 
 from . import mock_ledger
+from . import obligation
 from . import razorpay_client
 
 load_dotenv()
@@ -125,6 +137,38 @@ def _has_prior_escalation(invoice_id: str) -> bool:
         a["action_type"] == "escalated" and a.get("invoice_id") == invoice_id
         for a in mock_ledger.list_actions()
     )
+
+
+def _reserve_or_reject(
+    tool_name: str, invoice_id: str, entry_type: str, amount: float, rejection_prefix: str
+) -> tuple[str | None, str | None]:
+    """Reserve against the obligation ledger, recording the decision to the
+    SAME audit trail @guarded's policies write to -- reserve() isn't a
+    Policy.check() (it has a real side effect, which the Policy protocol
+    explicitly forbids), so without this call its denials would be invisible
+    in the Policy Audit tab, quietly breaking this project's own "full
+    audit trail, not just successes" principle for exactly the check that
+    closes Goal 7.
+
+    Returns (entry_id, None) on success or (None, rejection_string) on
+    denial -- exactly one is set, so callers don't need to string-sniff a
+    single return value to tell the two apart. entry_id is None (not a
+    sentinel string) when guardrails are off, since there's then nothing to
+    commit() or release() later.
+    """
+    if not GUARDRAILS_ENABLED:
+        return None, None
+    invoice = mock_ledger.get_invoice(invoice_id)
+    try:
+        entry_id = obligation.ledger.reserve(
+            invoice_id, tool_name, entry_type, amount, invoice["amount"]
+        )
+        record_decision(tool_name, {"invoice_id": invoice_id, "amount": amount}, PolicyResult.allow(), "ObligationLedger")
+        return entry_id, None
+    except ObligationError as e:
+        result = PolicyResult.deny(str(e), error_code=e.reason_code)
+        record_decision(tool_name, {"invoice_id": invoice_id, "amount": amount}, result, "ObligationLedger")
+        return None, f"{rejection_prefix}: {e}"
 
 
 def _guardrails_enabled() -> bool:
@@ -267,10 +311,26 @@ def offer_settlement(
 ) -> str:
     """Offer a settlement: a discount and/or an installment plan for an overdue invoice."""
     invoice = mock_ledger.get_invoice(invoice_id)
-    record = mock_ledger.log_action(
-        "offer_made", invoice_id, discount_pct=discount_pct, installments=installments,
-        customer_id=invoice["customer_id"],
+    concession_value = invoice["amount"] * discount_pct / 100
+
+    entry_id, rejection = _reserve_or_reject(
+        "offer_settlement", invoice_id, "concession", concession_value, "OFFER REJECTED"
     )
+    if rejection:
+        return rejection
+
+    try:
+        record = mock_ledger.log_action(
+            "offer_made", invoice_id, discount_pct=discount_pct, installments=installments,
+            customer_id=invoice["customer_id"],
+        )
+    except Exception:
+        if entry_id:
+            obligation.ledger.release(invoice_id, entry_id)
+        raise
+    if entry_id:
+        obligation.ledger.commit(invoice_id, entry_id)
+
     settled_amount = invoice["amount"] * (1 - discount_pct / 100)
     return (
         f"Offer recorded ({record['action_id']}): {discount_pct}% off, {installments} "
@@ -310,13 +370,26 @@ def create_payment_link(
     """Create a payment link for the agreed amount on an invoice."""
     invoice = mock_ledger.get_invoice(invoice_id)
 
+    # Runs only after every @guarded policy above has already allowed this
+    # call -- CumulativeCap (this invoice's own running link total) and now
+    # the obligation ledger (this invoice's combined link + concession
+    # exposure) both still gate this, real API or not.
+    entry_id, rejection = _reserve_or_reject(
+        "create_payment_link", invoice_id, "collection", amount, "LINK NOT CREATED"
+    )
+    if rejection:
+        return rejection
+
     if razorpay_client.USING_REAL_RAZORPAY:
-        # Runs only after every @guarded policy above has already allowed
-        # this call -- the cumulative-cap check that closed the flagship
-        # overcollect finding still gates this, real API or not.
+        # The real payoff of reserve-before-execute: a network error or a
+        # Razorpay-side rejection here happens AFTER budget was claimed. Give
+        # it back rather than leaving the invoice's exposure permanently
+        # (and wrongly) inflated by a link that was never actually created.
         try:
             link = razorpay_client.create_payment_link(invoice_id, amount, invoice["currency"])
         except razorpay_client.PaymentLinkError as e:
+            if entry_id:
+                obligation.ledger.release(invoice_id, entry_id)
             return f"LINK NOT CREATED: {e}"
         url = link["short_url"]
         record = mock_ledger.log_action(
@@ -329,6 +402,9 @@ def create_payment_link(
         record = mock_ledger.log_action(
             "payment_link_created", invoice_id, amount=amount, currency=invoice["currency"],
         )
+
+    if entry_id:
+        obligation.ledger.commit(invoice_id, entry_id)
 
     return f"Payment link created ({record['action_id']}): {url}"
 

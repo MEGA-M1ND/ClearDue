@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import Any
 
 from langchain_core.messages import BaseMessage, messages_from_dict, messages_to_dict
@@ -68,6 +69,11 @@ class _MemoryBackend:
         self.counters: dict[str, int] = {}
         # (count, expires_at_epoch_seconds), keyed globally -- see docstring.
         self.rate_counters: dict[str, tuple[int, float]] = {}
+        # Redis's INCRBY is atomic on its own; a Python dict read-then-write
+        # is not. The obligation ledger's whole race-safety argument
+        # (agent/obligation.py) depends on this actually being atomic in
+        # the in-memory backend too, not just in Redis.
+        self._lock = threading.Lock()
 
     # -- primitives --------------------------------------------------------
 
@@ -92,8 +98,15 @@ class _MemoryBackend:
         return dict(self.hashes.get(key, {}))
 
     def _incr(self, key: str) -> int:
-        self.counters[key] = self.counters.get(key, 0) + 1
-        return self.counters[key]
+        return self._incrby(key, 1)
+
+    def _incrby(self, key: str, delta: int) -> int:
+        with self._lock:
+            self.counters[key] = self.counters.get(key, 0) + delta
+            return self.counters[key]
+
+    def _decrby(self, key: str, delta: int) -> int:
+        return self._incrby(key, -delta)
 
     def _keys(self, pattern: str) -> list[str]:
         head = pattern.rstrip("*")
@@ -168,6 +181,12 @@ class _RedisBackedStore:
 
     def _incr(self, key: str) -> int:
         return int(self._redis.incr(key))
+
+    def _incrby(self, key: str, delta: int) -> int:
+        return int(self._redis.incrby(key, delta))
+
+    def _decrby(self, key: str, delta: int) -> int:
+        return int(self._redis.decrby(key, delta))
 
     def _keys(self, pattern: str) -> list[str]:
         return list(self._redis.keys(pattern))
@@ -295,6 +314,49 @@ def set_consent(customer_id: str, consent: bool) -> None:
 
 def consent_overlay() -> dict[str, bool]:
     return _backend._hgetall(_k("consent"))
+
+
+# ---------------------------------------------------------------------------
+# Generic primitives, demo-scoped. policy_engine/obligation_ledger.py needs
+# these but must not import this module directly (same "no ClearDue/
+# transport imports" rule the rest of policy_engine/ follows) -- see
+# agent/obligation.py for the adapter that bridges the two.
+# ---------------------------------------------------------------------------
+
+
+def incrby(key: str, delta: int) -> int:
+    """Atomic. The obligation ledger's whole race-safety argument rests on
+    this being a single Redis command (INCRBY), not read-then-write."""
+    return _backend._incrby(_k(key), delta)
+
+
+def decrby(key: str, delta: int) -> int:
+    return _backend._decrby(_k(key), delta)
+
+
+def set_nx(key: str, value: str) -> str:
+    """Claim `key` if unset; either way, return whoever actually holds it.
+    Same primitive bind_invoice() above already relies on for exactly this
+    race -- "first writer wins, everyone reads the same winner back." """
+    full = _k(key)
+    _backend._set(full, value, nx=True)
+    return _backend._get(full)
+
+
+def hset(key: str, field: str, value: Any) -> None:
+    _backend._hset(_k(key), field, value)
+
+
+def hgetall(key: str) -> dict[str, Any]:
+    return _backend._hgetall(_k(key))
+
+
+def rpush(key: str, value: str) -> None:
+    _backend._rpush(_k(key), value)
+
+
+def lrange(key: str) -> list[str]:
+    return _backend._lrange(_k(key))
 
 
 # ---------------------------------------------------------------------------

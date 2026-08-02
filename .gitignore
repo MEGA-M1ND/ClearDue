@@ -12,3 +12,4 @@ reports/*.jsonl
 
 .vercel/
 razorpay_writeup.md
+.pytest_cache/

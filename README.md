@@ -13,8 +13,8 @@ the seven evaluation goals with honest build status, and the before/after red-te
 
 | Phase | Status |
 |---|---|
-| 1 — Reviewer build + guided demo flow | 🔨 in progress |
-| 2 — Obligation ledger (cross-tool stacking) | ⬜ not started |
+| 1 — Reviewer build + guided demo flow | ✅ done |
+| 2 — Obligation ledger (cross-tool stacking) | ✅ done |
 | 3 — Merchant policy profiles + versioned decisions | ⬜ not started |
 | 4 — Razorpay webhook reconciliation | ⬜ not started |
 | 5 — Evaluation page + policy simulation | ⬜ not started |
@@ -232,15 +232,20 @@ with the model choosing to escalate on its own before the tool even needed to re
 
 ```
 agent/
-  mock_ledger.py     6 synthetic invoices, 5 customers, 1 merchant policy, action_log
+  mock_ledger.py     6 synthetic invoices, 5 customers, 1 merchant policy; reads merge
+                     the per-session overlay so two visitors see their own ledger
   agent.py           LangGraph agent, 8 tools, all guardrails declared via policy_engine
-  server.py          FastAPI: /, /chat, /health, /debug/*
+  server.py          FastAPI: /, /chat, /health, /debug/*, /api/reset
+  session.py         the httpOnly demo-session cookie every request is scoped by
+  store.py           Redis (or in-memory) storage, every key namespaced per session
+  obligation.py       wires policy_engine's ledger to store.py's primitives
   run_agent.py       entry point
   manual_test.py     benign sanity check
 
 policy_engine/
-  core.py            PolicyContext, PolicyResult, the @guarded() decorator, audit_log
-  policies.py        reusable Policy classes -- no ClearDue-specific imports
+  core.py               PolicyContext, PolicyResult, the @guarded() decorator, audit_log
+  policies.py           reusable Policy classes -- no ClearDue-specific imports
+  obligation_ledger.py  cross-tool invariant (reserve/commit/release), transport-free
 
 mcp_gateway/
   connection.py      one long-lived MCP session, callable synchronously
@@ -252,17 +257,21 @@ razorpay_mcp/
   rest.py            signed requests + a receipt log proving what actually executed
 
 adversary/
-  client.py          HTTP client for the target
-  goals.py            6 outcomes + ground-truth scorers
+  client.py          HTTP client for the target -- one cookie jar per run, so ground-
+                     truth reads see the same demo session the chat calls wrote into
+  goals.py           7 outcomes + ground-truth scorers
   debtor_agent.py     the LLM debtor: strategy selection, turn generation, failure summaries
   orchestrator.py     runs the 2-level adaptive search, writes reports/discovery_results.json
+  tests/
+    test_obligation_stacking.py   obligation ledger regression suite (pytest)
 
 public/
-  index.html          chat UI -- invoice picker, presets, two-tab log panel
+  index.html          chat UI -- scenario stepper, invoice picker, two-tab log panel
 
 reports/
   discovery_results.json                        generated, gitignored
   payment_link_overcollect_before_after.md       the flagship finding, committed
+  mcp_policy_gateway.md                          the MCP gateway, evidence both ways
 ```
 
 ---
