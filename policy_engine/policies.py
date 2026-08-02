@@ -16,6 +16,18 @@ from typing import Any, Callable
 from .core import Policy, PolicyContext, PolicyResult
 
 
+def _resolve(value_or_callable: Any) -> Any:
+    """A few thresholds below accept either a plain value or a zero-arg
+    callable, resolved fresh on every check() -- what makes a live-editable
+    MerchantPolicy (see policy_engine/merchant_policy.py) actually take
+    effect immediately, rather than only for tools defined after the edit.
+    The tool functions these policies guard are decorated once at module
+    import time and can't be redefined per-request, so this is the one
+    place "the current cap" can differ from "the cap when the process
+    started" without a full reload."""
+    return value_or_callable() if callable(value_or_callable) else value_or_callable
+
+
 class RecordMustExist(Policy):
     """The thing the call refers to (an invoice, an order, anything with an
     id) must actually exist. `get_record` returns None for an unknown id."""
@@ -108,7 +120,10 @@ class AllowedValues(Policy):
     name = "AllowedValues"
 
     def __init__(
-        self, field: str, allowed: list[str], enabled: Callable[[], bool] = lambda: True
+        self,
+        field: str,
+        allowed: list[str] | Callable[[], list[str]],
+        enabled: Callable[[], bool] = lambda: True,
     ):
         self._field = field
         self._allowed = allowed
@@ -117,8 +132,9 @@ class AllowedValues(Policy):
     def check(self, ctx: PolicyContext) -> PolicyResult:
         if not self._enabled():
             return PolicyResult.allow()
+        allowed = _resolve(self._allowed)
         value = ctx.args.get(self._field)
-        if value not in self._allowed:
+        if value not in allowed:
             return PolicyResult.deny(
                 f"{value!r} is not an approved value for {self._field}.",
                 error_code="invalid_value",
@@ -197,7 +213,7 @@ class EscalationOnConcession(Policy):
         self,
         get_record: Callable[[str], Any],
         size_of: Callable[[Any], float],
-        threshold: float,
+        threshold: float | Callable[[], float],
         is_concession: Callable[[PolicyContext, Any], bool],
         already_escalated: Callable[[str], bool],
         id_field: str = "invoice_id",
@@ -214,16 +230,17 @@ class EscalationOnConcession(Policy):
     def check(self, ctx: PolicyContext) -> PolicyResult:
         if not self._enabled():
             return PolicyResult.allow()
+        threshold = _resolve(self._threshold)
         record_id = ctx.args.get(self._id_field)
         record = self._get_record(record_id)
-        if record is None or self._size_of(record) < self._threshold:
+        if record is None or self._size_of(record) < threshold:
             return PolicyResult.allow()
         if not self._is_concession(ctx, record):
             return PolicyResult.allow()
         if self._already_escalated(record_id):
             return PolicyResult.allow()
         return PolicyResult.deny(
-            f"{record_id} is at or above the {self._threshold:,.0f} threshold that "
+            f"{record_id} is at or above the {threshold:,.0f} threshold that "
             "requires human sign-off before any concession, regardless of size. Use "
             "escalate_to_human instead.",
             error_code="escalation_required",
@@ -311,8 +328,8 @@ class NumericBounds(Policy):
     def __init__(
         self,
         field: str,
-        min_value: float | None = None,
-        max_value: float | None = None,
+        min_value: float | Callable[[], float] | None = None,
+        max_value: float | Callable[[], float] | None = None,
         enabled: Callable[[], bool] = lambda: True,
     ):
         self._field = field
@@ -326,14 +343,16 @@ class NumericBounds(Policy):
         value = ctx.args.get(self._field)
         if value is None:
             return PolicyResult.allow()
-        if self._min_value is not None and value < self._min_value:
+        min_value = _resolve(self._min_value)
+        max_value = _resolve(self._max_value)
+        if min_value is not None and value < min_value:
             return PolicyResult.deny(
-                f"{self._field} of {value} is below the minimum of {self._min_value}.",
+                f"{self._field} of {value} is below the minimum of {min_value}.",
                 error_code="out_of_bounds",
             )
-        if self._max_value is not None and value > self._max_value:
+        if max_value is not None and value > max_value:
             return PolicyResult.deny(
-                f"{self._field} of {value} exceeds the maximum of {self._max_value}.",
+                f"{self._field} of {value} exceeds the maximum of {max_value}.",
                 error_code="out_of_bounds",
             )
         return PolicyResult.allow()
@@ -352,17 +371,22 @@ class ToolAllowlist(Policy):
 
     name = "ToolAllowlist"
 
-    def __init__(self, allowed: list[str], enabled: Callable[[], bool] = lambda: True):
-        self._allowed = set(allowed)
+    def __init__(
+        self,
+        allowed: list[str] | Callable[[], list[str]],
+        enabled: Callable[[], bool] = lambda: True,
+    ):
+        self._allowed = allowed
         self._enabled = enabled
 
     def check(self, ctx: PolicyContext) -> PolicyResult:
         if not self._enabled():
             return PolicyResult.allow()
-        if ctx.tool_name not in self._allowed:
+        allowed = set(_resolve(self._allowed))
+        if ctx.tool_name not in allowed:
             return PolicyResult.deny(
                 f"{ctx.tool_name!r} is not on this agent's allowlist. Allowed: "
-                + ", ".join(sorted(self._allowed))
+                + ", ".join(sorted(allowed))
                 + ".",
                 error_code="tool_not_allowed",
             )
@@ -429,4 +453,46 @@ class WindowedBudget(Policy):
                     error_code="budget_exceeded",
                 )
 
+        return PolicyResult.allow()
+
+
+class MaxCallsPerRecord(Policy):
+    """The NUMBER of prior successful calls against the same record must not
+    reach a cap -- distinct from CumulativeCap, which bounds a running SUM.
+
+    Payment-link COUNT is the motivating example: a merchant may want to cap
+    how many separate links an invoice ever gets (fewer moving parts to
+    reconcile), independent of whether their combined amount still fits
+    under the invoice total -- CumulativeCap and this policy answer two
+    different questions and are meant to run side by side, not instead of
+    each other.
+    """
+
+    name = "MaxCallsPerRecord"
+
+    def __init__(
+        self,
+        prior_count: Callable[[PolicyContext], int],
+        cap: float | Callable[[], float],
+        id_field: str = "invoice_id",
+        enabled: Callable[[], bool] = lambda: True,
+        label: str = "calls",
+    ):
+        self._prior_count = prior_count
+        self._cap = cap
+        self._id_field = id_field
+        self._enabled = enabled
+        self._label = label
+
+    def check(self, ctx: PolicyContext) -> PolicyResult:
+        if not self._enabled():
+            return PolicyResult.allow()
+        prior = self._prior_count(ctx)
+        cap = _resolve(self._cap)
+        if prior + 1 > cap:
+            return PolicyResult.deny(
+                f"this would be {self._label} #{prior + 1} on {ctx.args.get(self._id_field)}, "
+                f"exceeding the cap of {cap:.0f}.",
+                error_code="count_cap_exceeded",
+            )
         return PolicyResult.allow()

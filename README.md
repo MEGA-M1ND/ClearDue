@@ -15,7 +15,7 @@ the seven evaluation goals with honest build status, and the before/after red-te
 |---|---|
 | 1 — Reviewer build + guided demo flow | ✅ done |
 | 2 — Obligation ledger (cross-tool stacking) | ✅ done |
-| 3 — Merchant policy profiles + versioned decisions | ⬜ not started |
+| 3 — Merchant policy profiles + versioned decisions | ✅ done |
 | 4 — Razorpay webhook reconciliation | ⬜ not started |
 | 5 — Evaluation page + policy simulation | ⬜ not started |
 
@@ -226,6 +226,30 @@ directions, live: a full-amount link on the ₹650,000 invoice now goes through 
 escalation; a genuine partial-payment request on the same invoice still gets escalated,
 with the model choosing to escalate on its own before the tool even needed to reject it.
 
+### Live merchant policy, versioned decision receipts, and a real review queue
+
+Every threshold above used to be read once from a constant at process start. It's now a
+`MerchantPolicy` object (`policy_engine/merchant_policy.py`) -- `GET`/`PUT
+/api/policy/{merchant_id}`, `PUT` gated behind `ADMIN_API_KEY`, each edit bumping a real
+`policy_version`. The load-bearing part: tools resolve it **fresh on every check**, not at
+import time (Python decorates a tool function once, forever -- so this had to be the
+policy *classes* re-resolving live values on each `check()`, not the tools somehow
+reloading). Verified live: dropped the discount cap from 15% to 5%, and the very next
+`offer_settlement` call anywhere was rejected against 5%, no restart. The system prompt is
+now a callable too (`create_react_agent` supports this natively) -- rebuilt every turn
+from the live policy, so the model is never confidently offering a number its own tool is
+about to reject.
+
+Every policy decision now also gets a `receipt_id`, a fingerprint of its inputs, and the
+`policy_version` that was active -- `GET /api/receipts`, `GET /api/receipts/{id}`, both
+scoped to the caller's own demo session, same isolation guarantee as everything else (a
+receipt lookup across sessions 404s, it doesn't leak). And `escalate_to_human` now opens a
+real `EscalationCase` (`agent/escalation.py`) instead of just logging an action --
+`GET /api/escalations`, `POST .../approve` / `.../reject` (`ADMIN_API_KEY`-gated). Full
+writeup, including the two places this deliberately deviates from `mcp_gateway/gateway.py`
+having a stake in this (it doesn't -- Razorpay's real tool schema has no invoice concept
+to key an obligation ledger against), is in [EVALUATION.md](EVALUATION.md).
+
 ---
 
 ## Repository layout
@@ -234,18 +258,26 @@ with the model choosing to escalate on its own before the tool even needed to re
 agent/
   mock_ledger.py     6 synthetic invoices, 5 customers, 1 merchant policy; reads merge
                      the per-session overlay so two visitors see their own ledger
-  agent.py           LangGraph agent, 8 tools, all guardrails declared via policy_engine
-  server.py          FastAPI: /, /chat, /health, /debug/*, /api/reset
+  agent.py           LangGraph agent, 8 tools, all guardrails declared via policy_engine,
+                     resolved LIVE from merchant_policy_store on every check
+  server.py          FastAPI: /, /chat, /health, /debug/*, /api/reset, /api/policy,
+                     /api/receipts, /api/escalations
   session.py         the httpOnly demo-session cookie every request is scoped by
-  store.py           Redis (or in-memory) storage, every key namespaced per session
+  store.py           Redis (or in-memory) storage, every key namespaced per session --
+                     except merchant policy, deliberately global (see merchant_policy_store.py)
   obligation.py       wires policy_engine's ledger to store.py's primitives
+  merchant_policy_store.py  wires policy_engine's MerchantPolicyStore to store.py's globals
+  escalation.py       the human review queue -- EscalationCase, create/list/approve/reject
   run_agent.py       entry point
   manual_test.py     benign sanity check
 
 policy_engine/
-  core.py               PolicyContext, PolicyResult, the @guarded() decorator, audit_log
+  core.py               PolicyContext, PolicyResult, the @guarded() decorator, audit_log,
+                         decision receipts (both via the same pluggable backend)
   policies.py           reusable Policy classes -- no ClearDue-specific imports
   obligation_ledger.py  cross-tool invariant (reserve/commit/release), transport-free
+  merchant_policy.py    versioned, editable MerchantPolicy -- transport-free
+  decision_receipt.py   PolicyDecisionReceipt shape + fingerprinting -- transport-free
 
 mcp_gateway/
   connection.py      one long-lived MCP session, callable synchronously

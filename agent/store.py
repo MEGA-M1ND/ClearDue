@@ -295,6 +295,18 @@ def list_audit() -> list[dict[str, Any]]:
     return [json.loads(r) for r in _backend._lrange(_k("audit_log"))]
 
 
+def save_receipt(receipt_id: str, record: dict[str, Any]) -> None:
+    """Duck-typed extension policy_engine.core.use_audit_backend looks for --
+    see policy_engine/decision_receipt.py. Reuses the same generic hash
+    primitives the invoice-status overlay already uses; no new storage
+    concept, just a new key."""
+    _backend._hset(_k("receipts"), receipt_id, record)
+
+
+def list_receipts() -> list[dict[str, Any]]:
+    return list(_backend._hgetall(_k("receipts")).values())
+
+
 # ---------------------------------------------------------------------------
 # Per-session overlay on the static ledger
 # ---------------------------------------------------------------------------
@@ -357,6 +369,24 @@ def rpush(key: str, value: str) -> None:
 
 def lrange(key: str) -> list[str]:
     return _backend._lrange(_k(key))
+
+
+# ---------------------------------------------------------------------------
+# Global (NOT demo-scoped) storage. Same category as rate limiting's
+# incr_with_ttl above: merchant policy is operator-level configuration, not
+# a visitor's own state -- a demo session's Reset button must not be able to
+# touch it, or any visitor could quietly weaken (or strengthen) the
+# guardrails a completely different visitor's negotiation is running
+# against. See policy_engine/merchant_policy.py.
+# ---------------------------------------------------------------------------
+
+
+def get_global(key: str) -> str | None:
+    return _backend._get(key)
+
+
+def set_global(key: str, value: str) -> None:
+    _backend._set(key, value)
 
 
 # ---------------------------------------------------------------------------

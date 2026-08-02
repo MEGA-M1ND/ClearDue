@@ -57,6 +57,7 @@ class GatewayDecision:
     reason: str | None = None
     policy: str | None = None
     error_code: str | None = None
+    receipt_id: str | None = None
 
     @property
     def rejected(self) -> bool:
@@ -140,7 +141,7 @@ class PolicyGateway:
         for policy in self.policies_for(tool_name):
             result = policy.check(ctx)
             policy_name = getattr(policy, "name", type(policy).__name__)
-            record_decision(f"mcp:{tool_name}", args, result, policy_name)
+            receipt = record_decision(f"mcp:{tool_name}", args, result, policy_name)
             if not result.allowed:
                 return GatewayDecision(
                     allowed=False,
@@ -150,22 +151,29 @@ class PolicyGateway:
                     reason=result.reason,
                     policy=policy_name,
                     error_code=result.error_code,
+                    receipt_id=receipt.receipt_id,
                 )
 
         # Every policy allowed. Only now does anything touch the transport.
         text = self._conn.call(tool_name, args)
+        exec_receipt = record_decision(
+            f"mcp:{tool_name}",
+            args,
+            PolicyResult.allow(),
+            "Executed",
+        )
+        # Cross-references the receipt that authorized this specific
+        # execution -- lets a caller trace "this HTTP call happened because
+        # of THIS decision" without re-deriving it from timing alone.
         self._executed.append(
             {
                 "ts": time.time(),
                 "tool": tool_name,
                 "args": args,
                 "amount": args.get(self._amount_field),
+                "policy_receipt_id": exec_receipt.receipt_id,
             }
         )
-        record_decision(
-            f"mcp:{tool_name}",
-            args,
-            PolicyResult.allow(),
-            "Executed",
+        return GatewayDecision(
+            allowed=True, tool=tool_name, args=args, text=text, receipt_id=exec_receipt.receipt_id
         )
-        return GatewayDecision(allowed=True, tool=tool_name, args=args, text=text)

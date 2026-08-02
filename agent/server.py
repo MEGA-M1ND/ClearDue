@@ -17,16 +17,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from policy_engine.core import list_audit_log, use_audit_backend
+from policy_engine.core import list_audit_log, use_audit_backend, use_receipt_context
 
 from . import agent as agent_module
+from . import escalation
 from . import mcp_runtime
+from . import merchant_policy_store
 from . import mock_ledger
 from . import session
 from . import rate_limit
 from . import store
 
 use_audit_backend(store)
+use_receipt_context(
+    # get_policy() self-seeds for ACTIVE_MERCHANT_ID (see
+    # merchant_policy_store.ensure_seeded()), so it never returns None here.
+    lambda: (
+        merchant_policy_store.ACTIVE_MERCHANT_ID,
+        merchant_policy_store.get_policy().policy_version,
+        session.current(),
+    )
+)
 
 app = FastAPI(title="ClearDue Collections Agent", version="0.1.0")
 
@@ -215,3 +226,156 @@ def debug_reset(x_debug_token: str | None = Header(default=None)) -> dict[str, A
     store.reset_all()
     mcp_runtime.reset()
     return {"status": "reset", "scope": "all sessions"}
+
+
+# ---------------------------------------------------------------------------
+# Merchant policy, decision receipts, and the escalation review queue --
+# Phase 3. Two different auth postures on purpose:
+#
+#   - GET endpoints are open, same as every other read-only /debug and /api
+#     endpoint in this app.
+#   - PUT (policy) and approve/reject (escalations) are gated behind
+#     ADMIN_API_KEY, a DIFFERENT secret from DEBUG_TOKEN. DEBUG_TOKEN
+#     protects shared DATA (an operator might reasonably hand it to
+#     co-presenters just to reset between demos); ADMIN_API_KEY protects
+#     the actual GUARDRAILS -- a PUT here can raise or lower the discount
+#     cap, escalation threshold, or which tools the agent may use at all,
+#     for every visitor, immediately. Unset means fully open, matching the
+#     convention every prior phase of this project uses for DEBUG_TOKEN --
+#     documented as a real, deliberate risk to accept or close by setting
+#     the env var, not a silent default choice.
+# ---------------------------------------------------------------------------
+
+_ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
+
+
+def _check_admin_key(x_admin_api_key: str | None) -> None:
+    if _ADMIN_API_KEY and not (x_admin_api_key and secrets.compare_digest(x_admin_api_key, _ADMIN_API_KEY)):
+        raise HTTPException(status_code=401, detail="missing or incorrect X-Admin-Api-Key")
+
+
+class ContactRulesUpdate(BaseModel):
+    channels_allowed: list[str] | None = None
+    require_opt_in: bool | None = None
+    max_contacts_per_day: int | None = None
+
+
+class PerWindowLimitsUpdate(BaseModel):
+    window_minutes: int | None = None
+    max_calls: int | None = None
+    max_amount_inr: float | None = None
+
+
+class MerchantPolicyUpdate(BaseModel):
+    """PATCH-shaped despite the PUT verb: every field is optional and only
+    the ones supplied are changed. A strict full-replacement PUT would force
+    a caller to re-send the entire policy just to nudge one number -- not
+    worth the REST purity for a config object this small."""
+
+    merchant_name: str | None = None
+    settlement_floor_pct: float | None = None
+    max_autonomous_discount_pct: float | None = None
+    max_installments: int | None = None
+    escalation_threshold_inr: float | None = None
+    payment_link_cap_per_invoice: int | None = None
+    tool_allowlist: list[str] | None = None
+    per_window_limits: PerWindowLimitsUpdate | None = None
+    contact_rules: ContactRulesUpdate | None = None
+
+
+@app.get("/api/policy/{merchant_id}")
+def get_merchant_policy(merchant_id: str) -> dict[str, Any]:
+    policy = merchant_policy_store.get_policy(merchant_id)
+    if policy is None:
+        raise HTTPException(status_code=404, detail=f"no policy for merchant_id {merchant_id!r}")
+    return policy.to_json()
+
+
+@app.put("/api/policy/{merchant_id}")
+def put_merchant_policy(
+    merchant_id: str,
+    update: MerchantPolicyUpdate,
+    x_admin_api_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _check_admin_key(x_admin_api_key)
+    policy = merchant_policy_store.get_policy(merchant_id)
+    if policy is None:
+        raise HTTPException(status_code=404, detail=f"no policy for merchant_id {merchant_id!r}")
+
+    changes = update.model_dump(exclude_unset=True)
+    for field in ("merchant_name", "settlement_floor_pct", "max_autonomous_discount_pct",
+                  "max_installments", "escalation_threshold_inr", "payment_link_cap_per_invoice",
+                  "tool_allowlist"):
+        if field in changes and changes[field] is not None:
+            setattr(policy, field, changes[field])
+    if changes.get("per_window_limits"):
+        for k, v in changes["per_window_limits"].items():
+            if v is not None:
+                setattr(policy.per_window_limits, k, v)
+    if changes.get("contact_rules"):
+        for k, v in changes["contact_rules"].items():
+            if v is not None:
+                setattr(policy.contact_rules, k, v)
+
+    policy.policy_version = merchant_policy_store.next_version(policy.policy_version)
+    merchant_policy_store.save_policy(policy)
+    return policy.to_json()
+
+
+@app.get("/api/receipts")
+def list_receipts(request: Request, response: Response) -> dict[str, Any]:
+    """The caller's own policy decision receipts, newest first, capped at 50.
+
+    Deliberately scoped by the caller's OWN demo-session cookie, not a
+    client-suppliable `session_id` query parameter -- accepting an arbitrary
+    session_id here would let any visitor read any OTHER visitor's decision
+    history, directly undoing the per-visitor isolation Phase 1 built and
+    verified against this exact live deployment. See agent/session.py.
+    """
+    session.bind(request, response)
+    receipts = sorted(store.list_receipts(), key=lambda r: r["ts"], reverse=True)[:50]
+    return {"count": len(receipts), "receipts": receipts}
+
+
+@app.get("/api/receipts/{receipt_id}")
+def get_receipt(receipt_id: str, request: Request, response: Response) -> dict[str, Any]:
+    session.bind(request, response)
+    for r in store.list_receipts():
+        if r.get("receipt_id") == receipt_id:
+            return r
+    raise HTTPException(status_code=404, detail=f"no receipt {receipt_id!r} in this session")
+
+
+@app.get("/api/escalations")
+def list_escalations(
+    request: Request, response: Response, status: str | None = None
+) -> dict[str, Any]:
+    session.bind(request, response)
+    cases = escalation.list_cases(status=status)
+    return {"count": len(cases), "cases": cases}
+
+
+@app.post("/api/escalations/{case_id}/approve")
+def approve_escalation(
+    case_id: str, request: Request, response: Response,
+    note: str | None = None, x_admin_api_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _check_admin_key(x_admin_api_key)
+    session.bind(request, response)
+    case = escalation.approve(case_id, note=note)
+    if case is None:
+        raise HTTPException(status_code=404, detail=f"no case {case_id!r} in this session")
+    return case
+
+
+@app.post("/api/escalations/{case_id}/reject")
+def reject_escalation(
+    case_id: str, request: Request, response: Response,
+    note: str | None = None, x_admin_api_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _check_admin_key(x_admin_api_key)
+    session.bind(request, response)
+    case = escalation.reject(case_id, note=note)
+    if case is None:
+        raise HTTPException(status_code=404, detail=f"no case {case_id!r} in this session")
+    return case

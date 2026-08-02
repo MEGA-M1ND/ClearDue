@@ -24,6 +24,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
+from .decision_receipt import PolicyDecisionReceipt, new_receipt
+
 
 @dataclass
 class PolicyContext:
@@ -85,16 +87,49 @@ class Policy(Protocol):
 audit_log: list[dict[str, Any]] = []
 _audit_backend: Any = None
 
+# Resolves (merchant_id, policy_version, session_id) for every receipt this
+# module mints. Pluggable for the same reason use_audit_backend is: this
+# module must not import agent.merchant_policy_store or agent.session
+# directly (the "no ClearDue-specific imports" rule policy_engine/ follows
+# throughout). Unconfigured, receipts still get minted -- just stamped
+# "unknown"/"unversioned" rather than left out, so a caller that never
+# bothers to configure this still gets a working (if less informative)
+# receipt rather than a crash.
+_receipt_context: Callable[[], tuple[str, str, str]] = lambda: ("unknown", "unversioned", "")
+
 
 def use_audit_backend(backend: Any) -> None:
     """Redirect the audit log to an external backend exposing
-    append_audit(record) and list_audit() -> list[dict]. Optional -- call
-    site's responsibility to also handle resetting that backend."""
+    append_audit(record) / list_audit() -> list[dict], and OPTIONALLY
+    save_receipt(receipt_id, record) / list_receipts() -> list[dict] for
+    per-receipt lookup (see policy_engine/decision_receipt.py). The receipt
+    methods are duck-typed, not required -- a backend that only implements
+    the original audit contract still works, it just won't support
+    GET /api/receipts/{id} lookups. Optional either way; call site's
+    responsibility to also handle resetting the backend."""
     global _audit_backend
     _audit_backend = backend
 
 
-def _record(tool_name: str, call_args: dict, result: PolicyResult, policy_name: str) -> None:
+def use_receipt_context(fn: Callable[[], tuple[str, str, str]]) -> None:
+    global _receipt_context
+    _receipt_context = fn
+
+
+def _record(
+    tool_name: str, call_args: dict, result: PolicyResult, policy_name: str
+) -> PolicyDecisionReceipt:
+    merchant_id, policy_version, session_id = _receipt_context()
+    receipt = new_receipt(
+        tool_name=tool_name,
+        args=call_args,
+        decision="ALLOW" if result.allowed else "DENY",
+        reason_code=result.error_code,
+        reason_text=result.reason,
+        merchant_id=merchant_id,
+        policy_version=policy_version,
+        session_id=session_id,
+    )
     entry = {
         "tool": tool_name,
         "args": {k: v for k, v in call_args.items() if k != "state"},
@@ -102,21 +137,37 @@ def _record(tool_name: str, call_args: dict, result: PolicyResult, policy_name: 
         "allowed": result.allowed,
         "reason": result.reason,
         "ts": time.time(),
+        # Everything above is unchanged from before receipts existed --
+        # /debug/policy_log keeps working exactly as it always has. These
+        # ride along on the SAME dict so the audit-log entry and the
+        # indexed receipt can never drift out of sync with each other.
+        "receipt_id": receipt.receipt_id,
+        "policy_version": receipt.policy_version,
+        "merchant_id": receipt.merchant_id,
+        "inputs_fingerprint": receipt.inputs_fingerprint,
+        "decision": receipt.decision,
     }
     if _audit_backend is not None:
         _audit_backend.append_audit(entry)
+        save_receipt = getattr(_audit_backend, "save_receipt", None)
+        if save_receipt is not None:
+            save_receipt(receipt.receipt_id, entry)
     else:
         audit_log.append(entry)
+    return receipt
 
 
 def record_decision(
     tool_name: str, call_args: dict, result: PolicyResult, policy_name: str
-) -> None:
+) -> PolicyDecisionReceipt:
     """Public entry point for enforcement points that are not the guarded()
     decorator -- notably mcp_gateway, which intercepts MCP `tools/call`
     rather than wrapping a Python function. Same audit log either way, so a
-    reviewer sees one trail regardless of which layer made the decision."""
-    _record(tool_name, call_args, result, policy_name)
+    reviewer sees one trail regardless of which layer made the decision.
+    Returns the receipt so a caller (mcp_gateway attaches receipt_id to its
+    own execution records) can cross-reference exactly which decision
+    authorized what actually ran."""
+    return _record(tool_name, call_args, result, policy_name)
 
 
 def list_audit_log() -> list[dict[str, Any]]:

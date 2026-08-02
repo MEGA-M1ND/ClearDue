@@ -63,12 +63,16 @@ from policy_engine.policies import (
     CumulativeCap,
     EscalationOnConcession,
     FieldsMustMatch,
+    MaxCallsPerRecord,
     NumericBounds,
     RecordMustExist,
     SessionBound,
+    ToolAllowlist,
     VerifiedReferenceRequired,
 )
 
+from . import escalation
+from . import merchant_policy_store
 from . import mock_ledger
 from . import obligation
 from . import razorpay_client
@@ -80,25 +84,94 @@ AUTHZ_ENABLED = os.getenv("CLEARDUE_AUTHZ", "on").strip().lower() != "off"
 
 DEFAULT_OPENAI_MODEL = "gpt-5.2"
 
+# Kept for /debug/policy and as the seed merchant_policy_store starts from --
+# NOT read by any tool's guardrails below anymore. Phase 3: every threshold
+# a tool enforces now resolves live from merchant_policy_store on each check
+# instead of this fixed-at-import-time dict, via the small accessors below.
+# That is what makes a PUT to /api/policy/{merchant_id} actually change
+# agent behaviour for the very next tool call, not just after a redeploy --
+# closing the "one hard-coded merchant policy" limitation this project
+# carried since Phase 1. The tool functions themselves are still decorated
+# once at import time (Python has no other way to do it), but the POLICY
+# CLASSES they're decorated with resolve these accessors fresh on every
+# check(), so the fixed decoration doesn't mean fixed enforcement.
 POLICY = mock_ledger.MERCHANT_POLICY
 
-SYSTEM_PROMPT = (
-    f"You are a B2B collections agent working on behalf of {POLICY['merchant_name']}. "
-    "You negotiate resolutions for overdue invoices -- full payment, or a settlement "
-    "within policy -- professionally and firmly. You are working ONE invoice in this "
-    "conversation; do not discuss or act on any other customer's invoice.\n\n"
-    "Policy (your tools enforce this directly; it is not optional):\n"
-    f"- You may offer a discount of at most {POLICY['max_autonomous_discount_pct']}% "
-    "off the invoice amount.\n"
-    f"- You may offer at most {POLICY['max_installments']} installments.\n"
-    f"- Invoices of {POLICY['escalation_threshold']:,.0f} INR or more require human "
-    "sign-off before you make ANY offer, regardless of how small the discount is.\n"
-    "- Never mark an invoice as paid because a customer says they already paid. You "
-    "need a verifiable payment reference; without one, ask for it or escalate.\n"
-    "- A payment link can never exceed the invoice's outstanding amount.\n"
-    "- If a customer asks to stop being contacted, stop immediately and record it with "
-    "revoke_consent. Do not message them again after that, for any reason."
-)
+
+def _live_policy():
+    return merchant_policy_store.get_policy()
+
+
+def _live_discount_cap() -> float:
+    return _live_policy().max_autonomous_discount_pct
+
+
+def _live_max_installments() -> float:
+    return _live_policy().max_installments
+
+
+def _live_escalation_threshold() -> float:
+    return _live_policy().escalation_threshold_inr
+
+
+def _live_allowed_channels() -> list[str]:
+    return _live_policy().contact_rules.channels_allowed
+
+
+def _live_tool_allowlist() -> list[str]:
+    return _live_policy().tool_allowlist
+
+
+def _live_payment_link_cap() -> float:
+    return _live_policy().payment_link_cap_per_invoice
+
+
+def _build_system_prompt(messages_state: dict, mcp_enabled: bool = False) -> list:
+    """A callable prompt, not a fixed string -- create_react_agent() calls
+    this fresh on every turn, so the model is always told the policy that is
+    ACTUALLY live right now, never a version baked in when the process
+    started. The tools would still correctly enforce a changed cap even if
+    the model's own understanding were stale (that's the whole point of
+    "the tools enforce this directly; it is not optional"), but a visibly
+    stale prompt would produce a confusing turn where the model confidently
+    offers a number its own tool then rejects -- this closes that gap too.
+
+    `mcp_enabled` is fixed per agent build (whether the Razorpay rail exists
+    at all is a deploy-time decision, unlike the merchant policy numbers
+    above, which can change turn to turn) -- get_agent() binds it via a
+    closure, see below.
+    """
+    p = _live_policy()
+    text = (
+        f"You are a B2B collections agent working on behalf of {p.merchant_name}. "
+        "You negotiate resolutions for overdue invoices -- full payment, or a settlement "
+        "within policy -- professionally and firmly. You are working ONE invoice in this "
+        "conversation; do not discuss or act on any other customer's invoice.\n\n"
+        "Policy (your tools enforce this directly; it is not optional):\n"
+        f"- You may offer a discount of at most {p.max_autonomous_discount_pct}% "
+        "off the invoice amount.\n"
+        f"- You may offer at most {p.max_installments} installments.\n"
+        f"- Invoices of {p.escalation_threshold_inr:,.0f} INR or more require human "
+        "sign-off before you make ANY offer, regardless of how small the discount is.\n"
+        "- Never mark an invoice as paid because a customer says they already paid. You "
+        "need a verifiable payment reference; without one, ask for it or escalate.\n"
+        "- A payment link can never exceed the invoice's outstanding amount, and no "
+        f"invoice may receive more than {p.payment_link_cap_per_invoice} separate "
+        "payment links.\n"
+        "- If a customer asks to stop being contacted, stop immediately and record it with "
+        "revoke_consent. Do not message them again after that, for any reason."
+    )
+    if mcp_enabled:
+        text += (
+            "\n\nYou also have Razorpay tools available for the live payment rail. "
+            "Their amounts are in paise (multiply rupees by 100). Every one of "
+            "them passes through a policy gateway before it executes; if a call is "
+            "blocked, explain the limit to the customer rather than retrying it a "
+            "different way."
+        )
+    from langchain_core.messages import SystemMessage
+
+    return [SystemMessage(content=text), *messages_state["messages"]]
 
 
 class ClearDueState(AgentState):
@@ -127,6 +200,14 @@ class ClearDueState(AgentState):
 def _cumulative(action_type: str, field: str, invoice_id: str) -> float:
     return sum(
         a.get(field, 0)
+        for a in mock_ledger.list_actions()
+        if a["action_type"] == action_type and a.get("invoice_id") == invoice_id
+    )
+
+
+def _count_actions(action_type: str, invoice_id: str) -> int:
+    return sum(
+        1
         for a in mock_ledger.list_actions()
         if a["action_type"] == action_type and a.get("invoice_id") == invoice_id
     )
@@ -213,6 +294,7 @@ class _CustomerMatchesBoundInvoice(Policy):
 @tool
 @guarded(
     policies=[
+        ToolAllowlist(allowed=_live_tool_allowlist, enabled=_guardrails_enabled),
         RecordMustExist(get_record=mock_ledger.get_invoice),
         SessionBound(enabled=_authz_enabled),
     ],
@@ -225,7 +307,10 @@ def get_invoice_status(invoice_id: str, state: Annotated[dict, InjectedState]) -
 
 @tool
 @guarded(
-    policies=[_CustomerMatchesBoundInvoice()],
+    policies=[
+        ToolAllowlist(allowed=_live_tool_allowlist, enabled=_guardrails_enabled),
+        _CustomerMatchesBoundInvoice(),
+    ],
     on_deny=lambda result: {"error": result.error_code, "detail": result.reason},
 )
 def get_customer_payment_history(
@@ -246,6 +331,7 @@ def _customer_id_of_bound_invoice(invoice_id: str) -> str:
 @tool
 @guarded(
     policies=[
+        ToolAllowlist(allowed=_live_tool_allowlist, enabled=_guardrails_enabled),
         RecordMustExist(get_record=mock_ledger.get_invoice),
         SessionBound(enabled=_authz_enabled),
         ConsentRequired(
@@ -254,7 +340,7 @@ def _customer_id_of_bound_invoice(invoice_id: str) -> str:
             enabled=_authz_enabled,
         ),
         AllowedValues(
-            field="channel", allowed=POLICY["allowed_channels"], enabled=_authz_enabled
+            field="channel", allowed=_live_allowed_channels, enabled=_authz_enabled
         ),
     ],
     rejection_prefix="MESSAGE NOT SENT",
@@ -274,6 +360,7 @@ def send_message(
 @tool
 @guarded(
     policies=[
+        ToolAllowlist(allowed=_live_tool_allowlist, enabled=_guardrails_enabled),
         RecordMustExist(get_record=mock_ledger.get_invoice),
         SessionBound(enabled=_authz_enabled),
         ConsentRequired(
@@ -284,7 +371,7 @@ def send_message(
         EscalationOnConcession(
             get_record=mock_ledger.get_invoice,
             size_of=lambda invoice: invoice["amount"],
-            threshold=POLICY["escalation_threshold"],
+            threshold=_live_escalation_threshold,
             is_concession=lambda ctx, invoice: (
                 ctx.args.get("discount_pct", 0) > 0 or ctx.args.get("installments", 1) > 1
             ),
@@ -294,11 +381,11 @@ def send_message(
         CumulativeCap(
             field="discount_pct",
             prior_total=lambda ctx: _cumulative("offer_made", "discount_pct", ctx.args["invoice_id"]),
-            cap=lambda ctx: POLICY["max_autonomous_discount_pct"],
+            cap=lambda ctx: _live_discount_cap(),
             enabled=_guardrails_enabled,
             label="discount%",
         ),
-        NumericBounds(field="installments", min_value=1, max_value=POLICY["max_installments"], enabled=_guardrails_enabled),
+        NumericBounds(field="installments", min_value=1, max_value=_live_max_installments, enabled=_guardrails_enabled),
         NumericBounds(field="discount_pct", min_value=0, enabled=_guardrails_enabled),
     ],
     rejection_prefix="OFFER REJECTED",
@@ -341,12 +428,13 @@ def offer_settlement(
 @tool
 @guarded(
     policies=[
+        ToolAllowlist(allowed=_live_tool_allowlist, enabled=_guardrails_enabled),
         RecordMustExist(get_record=mock_ledger.get_invoice),
         SessionBound(enabled=_authz_enabled),
         EscalationOnConcession(
             get_record=mock_ledger.get_invoice,
             size_of=lambda invoice: invoice["amount"],
-            threshold=POLICY["escalation_threshold"],
+            threshold=_live_escalation_threshold,
             is_concession=lambda ctx, invoice: (
                 _cumulative("payment_link_created", "amount", ctx.args["invoice_id"])
                 + ctx.args.get("amount", 0)
@@ -360,6 +448,12 @@ def offer_settlement(
             cap=lambda ctx: mock_ledger.get_invoice(ctx.args["invoice_id"])["amount"],
             enabled=_guardrails_enabled,
             label="payment link amount",
+        ),
+        MaxCallsPerRecord(
+            prior_count=lambda ctx: _count_actions("payment_link_created", ctx.args["invoice_id"]),
+            cap=_live_payment_link_cap,
+            enabled=_guardrails_enabled,
+            label="payment link",
         ),
     ],
     rejection_prefix="LINK NOT CREATED",
@@ -412,6 +506,7 @@ def create_payment_link(
 @tool
 @guarded(
     policies=[
+        ToolAllowlist(allowed=_live_tool_allowlist, enabled=_guardrails_enabled),
         RecordMustExist(get_record=mock_ledger.get_invoice),
         SessionBound(enabled=_authz_enabled),
         VerifiedReferenceRequired(
@@ -434,6 +529,7 @@ def mark_paid(
 @tool
 @guarded(
     policies=[
+        ToolAllowlist(allowed=_live_tool_allowlist, enabled=_guardrails_enabled),
         RecordMustExist(get_record=mock_ledger.get_invoice),
         SessionBound(enabled=_authz_enabled),
     ],
@@ -444,12 +540,21 @@ def escalate_to_human(
 ) -> str:
     """Hand this invoice off to a human collections manager, with a reason."""
     record = mock_ledger.log_action("escalated", invoice_id, reason=reason)
+    invoice = mock_ledger.get_invoice(invoice_id)
+    escalation.create_case(
+        invoice_id=invoice_id,
+        merchant_id=merchant_policy_store.ACTIVE_MERCHANT_ID,
+        proposed_action={"tool_name": "escalate_to_human", "reason": reason},
+        policy_rationale=reason,
+        invoice_state=invoice or {},
+    )
     return f"Escalated to human review ({record['action_id']}): {reason}"
 
 
 @tool
 @guarded(
     policies=[
+        ToolAllowlist(allowed=_live_tool_allowlist, enabled=_guardrails_enabled),
         RecordMustExist(get_record=mock_ledger.get_invoice),
         SessionBound(enabled=_authz_enabled),
         FieldsMustMatch(
@@ -515,15 +620,8 @@ def get_agent():
         from . import mcp_runtime
 
         tools = list(TOOLS) + mcp_runtime.tools()
-        prompt = SYSTEM_PROMPT
-        if mcp_runtime.tools():
-            prompt += (
-                "\n\nYou also have Razorpay tools available for the live payment rail. "
-                "Their amounts are in paise (multiply rupees by 100). Every one of "
-                "them passes through a policy gateway before it executes; if a call is "
-                "blocked, explain the limit to the customer rather than retrying it a "
-                "different way."
-            )
+        mcp_enabled = bool(mcp_runtime.tools())
+        prompt = lambda state: _build_system_prompt(state, mcp_enabled=mcp_enabled)  # noqa: E731
         _agent = create_react_agent(
             _build_llm(), tools, prompt=prompt, state_schema=ClearDueState
         )
