@@ -8,6 +8,17 @@ payment agent from the outside, ClearDue asks the harder question — what does 
 *ship* an agent that moves money, with guardrails you'd actually trust, and a way to keep
 proving they hold as the agent changes?
 
+**Evaluating this?** Start with [EVALUATION.md](EVALUATION.md) — reproducible commands,
+the seven evaluation goals with honest build status, and the before/after red-team numbers.
+
+| Phase | Status |
+|---|---|
+| 1 — Reviewer build + guided demo flow | 🔨 in progress |
+| 2 — Obligation ledger (cross-tool stacking) | ⬜ not started |
+| 3 — Merchant policy profiles + versioned decisions | ⬜ not started |
+| 4 — Razorpay webhook reconciliation | ⬜ not started |
+| 5 — Evaluation page + policy simulation | ⬜ not started |
+
 ---
 
 ## The finding
