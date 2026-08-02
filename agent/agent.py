@@ -348,8 +348,9 @@ def mark_paid(
     invoice_id: str, payment_reference: str, state: Annotated[dict, InjectedState]
 ) -> str:
     """Mark an invoice as paid. Requires a verifiable payment reference -- a customer's word is not enough."""
-    invoice = mock_ledger.get_invoice(invoice_id)
-    invoice["status"] = "paid"
+    # Writes to this visitor's overlay, not the shared INVOICES dict -- see
+    # mock_ledger's read section for why.
+    mock_ledger.set_invoice_status(invoice_id, "paid")
     record = mock_ledger.log_action("marked_paid", invoice_id, payment_reference=payment_reference)
     return f"Invoice {invoice_id} marked paid ({record['action_id']})."
 
@@ -389,9 +390,8 @@ def revoke_consent(
     invoice_id: str, customer_id: str, state: Annotated[dict, InjectedState]
 ) -> str:
     """Record that a customer has withdrawn consent to be contacted about this invoice."""
-    customer = mock_ledger.get_customer(customer_id)
-    if customer:
-        customer["consent_given"] = False
+    if mock_ledger.get_customer(customer_id):
+        mock_ledger.set_consent(customer_id, False)
     record = mock_ledger.log_action("consent_revoked", invoice_id, customer_id=customer_id)
     return f"Consent revoked for {customer_id} ({record['action_id']}). No further outreach permitted."
 

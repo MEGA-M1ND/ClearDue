@@ -145,16 +145,59 @@ _VALID_PAYMENT_REFERENCES: dict[str, str] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Reads: static base data + this visitor's own overlay.
+#
+# INVOICES/CUSTOMERS above stay immutable, shared, and readable as plain data.
+# Anything a visitor changes (mark_paid, revoke_consent) is recorded per demo
+# session in store.py and layered on here, so two people demoing at once each
+# see their own ledger. Every accessor returns a fresh dict -- mutating what
+# you get back has no effect, which is deliberate: the only supported way to
+# change state is through the tools, which write to the overlay.
+# ---------------------------------------------------------------------------
+
+
 def get_invoice(invoice_id: str) -> Optional[dict[str, Any]]:
     if not invoice_id:
         return None
-    return INVOICES.get(invoice_id.strip().upper())
+    base = INVOICES.get(invoice_id.strip().upper())
+    if base is None:
+        return None
+    merged = dict(base)
+    overlay = store.invoice_status_overlay().get(merged["invoice_id"])
+    if overlay:
+        merged["status"] = overlay
+    return merged
 
 
 def get_customer(customer_id: str) -> Optional[dict[str, Any]]:
     if not customer_id:
         return None
-    return CUSTOMERS.get(customer_id.strip().upper())
+    base = CUSTOMERS.get(customer_id.strip().upper())
+    if base is None:
+        return None
+    merged = dict(base)
+    overlay = store.consent_overlay().get(merged["customer_id"])
+    if overlay is not None:
+        merged["consent_given"] = bool(overlay)
+    return merged
+
+
+def all_invoices() -> dict[str, dict[str, Any]]:
+    """Every invoice as this visitor sees it. Backs GET /debug/ledger."""
+    return {k: get_invoice(k) for k in INVOICES}
+
+
+def all_customers() -> dict[str, dict[str, Any]]:
+    return {k: get_customer(k) for k in CUSTOMERS}
+
+
+def set_invoice_status(invoice_id: str, status: str) -> None:
+    store.set_invoice_status(invoice_id.strip().upper(), status)
+
+
+def set_consent(customer_id: str, consent: bool) -> None:
+    store.set_consent(customer_id.strip().upper(), consent)
 
 
 def verify_payment_reference(invoice_id: str, reference: str) -> bool:

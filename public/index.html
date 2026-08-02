@@ -542,7 +542,7 @@
         <span class="lab">Invoice</span>
         <select id="invoiceSelect"><option value="">loading…</option></select>
       </label>
-      <button class="ghostBtn" id="btnReset">Reset ledger &amp; conversation</button>
+      <button class="ghostBtn" id="btnReset">Reset demo state</button>
       <div class="sessTag" id="sessTag"></div>
     </div>
   </aside>
@@ -617,7 +617,6 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const BASE = window.location.origin;
-const TOKEN_KEY = "cleardue-debug-token";
 
 const streamInner = $("streamInner");
 const invoiceSel  = $("invoiceSelect");
@@ -640,6 +639,22 @@ function scrollDown() {
 function clearHero() {
   const h = $("hero");
   if (h) h.remove();
+}
+
+/* The hero holds the proof stepper, and a reset wipes the whole stream to get
+   back to a clean slate -- which would take the stepper with it. Snapshot the
+   markup once at load so a reset can put the landing state back exactly as it
+   was, rather than leaving an empty page. */
+const HERO_HTML = ($("hero") || {}).outerHTML || "";
+
+function restoreHero() {
+  if ($("hero") || !HERO_HTML) return;
+  streamInner.insertAdjacentHTML("afterbegin", HERO_HTML);
+  // Fresh nodes need their listeners back.
+  renderProof();
+  $("proofRunAll").onclick = runAllProof;
+  $("proofResetBtn").onclick = resetProof;
+  countUpStat();
 }
 
 /* Rejection detection.
@@ -1401,14 +1416,18 @@ function policyCard(e) {
 
 /* ------------------------------------------------------------------ reset */
 
-/* Just the server call, so the proof stepper can reset shared state without
-   clearing the stream it lives in. Returns "ok" | "auth" | "fail". */
+/* Clears only this visitor's own demo state, so it needs no operator token --
+   the server scopes the delete to the demo session in our own cookie. Split
+   out from doReset() so the proof stepper can reset without clearing the
+   stream it lives inside. Returns "ok" | "fail". */
 async function serverReset() {
-  const token = sessionStorage.getItem(TOKEN_KEY);
-  const headers = token ? { "X-Debug-Token": token } : {};
   try {
-    const r = await fetch(BASE + "/debug/reset", { method: "POST", headers, signal: AbortSignal.timeout(9000) });
-    return r.ok ? "ok" : (r.status === 401 ? "auth" : "fail");
+    const r = await fetch(BASE + "/api/reset", {
+      method: "POST",
+      credentials: "same-origin",   // the demo-session cookie IS the scope
+      signal: AbortSignal.timeout(9000),
+    });
+    return r.ok ? "ok" : "fail";
   } catch (e) {
     return "fail";
   }
@@ -1422,39 +1441,13 @@ async function doReset() {
   await loadLedger();
   refreshLog();
 
-  if (state === "ok") {
-    addMsg("note", "Server ledger and all sessions reset.");
-  } else if (state === "auth") {
-    addMsg("note", "Conversation reset. The server ledger is protected by a debug token.");
-    askForToken();
-  } else {
-    addMsg("note", "Conversation reset. Could not reach the server ledger.");
-  }
-}
+  proofState = PROOF_STEPS.map(() => "idle");
+  Object.keys(proofSessions).forEach(k => delete proofSessions[k]);
+  restoreHero();
 
-/* The deployed instance sets DEBUG_TOKEN, so POST /debug/reset returns 401
-   without a matching header. Rather than silently swallowing that (which is
-   what the previous version did), offer a one-off place to paste it. Held in
-   sessionStorage only -- it is never written to disk or sent anywhere except
-   this origin's own /debug/reset. */
-function askForToken() {
-  if ($("tokenRow")) return;
-  const row = document.createElement("div");
-  row.id = "tokenRow";
-  row.style.cssText = "max-width:420px;margin:.2rem auto;display:flex;gap:.4rem;align-items:center";
-  row.innerHTML =
-    `<input class="txtin" id="tokenIn" type="password" placeholder="X-Debug-Token (optional)" autocomplete="off">` +
-    `<button class="ghostBtn" id="tokenSave" style="width:auto;padding:.44rem .8rem">Save</button>`;
-  streamInner.appendChild(row);
-  $("tokenSave").onclick = () => {
-    const v = $("tokenIn").value.trim();
-    if (!v) return;
-    sessionStorage.setItem(TOKEN_KEY, v);
-    row.remove();
-    doReset();
-  };
-  $("tokenIn").addEventListener("keydown", e => { if (e.key === "Enter") $("tokenSave").click(); });
-  scrollDown();
+  if (state !== "ok") {
+    addMsg("note", "Reset locally, but the server couldn't be reached.");
+  }
 }
 
 /* ------------------------------------------------------------------- rails */

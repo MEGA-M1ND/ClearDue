@@ -1,7 +1,7 @@
 """Session/ledger storage, backed by whatever process model is actually running.
 
 Local dev (`python agent/run_agent.py`) is one long-lived process, so plain
-in-memory dicts/lists work fine and that's the default -- zero setup, matches
+in-memory dicts work fine and that's the default -- zero setup, matches
 every phase of this project up to now.
 
 Deployed on Vercel, the FastAPI app runs as a serverless function. Instances
@@ -18,6 +18,19 @@ same as PaySentry's target_agent/store.py:
 There is no separate flag to keep in sync with the environment -- the
 presence of these variables IS the switch, so local dev and the deployed
 build run identical code.
+
+INVARIANT: every key written here is namespaced under the caller's demo
+session (see agent/session.py), so concurrent visitors to the public demo
+cannot see or clobber each other's state. The one deliberate exception is
+incr_with_ttl, which rate limiting uses -- those counters key on client IP
+and must stay global, since a limit you can reset by clearing a cookie is
+not a limit.
+
+Invoice status and customer consent are stored as a per-session *overlay*
+rather than by copying the whole ledger: mock_ledger.py keeps the six
+invoices as static Python, and a visitor's mutations (mark_paid,
+revoke_consent) are recorded here and layered on read. That keeps the ledger
+readable as plain data while still giving each visitor their own view of it.
 """
 
 from __future__ import annotations
@@ -28,56 +41,73 @@ from typing import Any
 
 from langchain_core.messages import BaseMessage, messages_from_dict, messages_to_dict
 
+from . import session
+
 _REDIS_URL = os.getenv("REDIS_URL")
 _KV_URL = os.getenv("KV_REST_API_URL")
 _KV_TOKEN = os.getenv("KV_REST_API_TOKEN")
 USING_KV = bool(_REDIS_URL) or bool(_KV_URL and _KV_TOKEN)
 
-_ACTION_LOG_KEY = "cleardue:action_log"
-_AUDIT_LOG_KEY = "cleardue:audit_log"
-_ACTION_SEQ_KEY = "cleardue:action_seq"
+
+def _prefix(scope: str | None = None) -> str:
+    return f"demo:{scope or session.current()}"
+
+
+def _k(suffix: str, scope: str | None = None) -> str:
+    return f"{_prefix(scope)}:{suffix}"
 
 
 class _MemoryBackend:
-    """Default backend: the same in-memory dicts/lists this project always used."""
+    """Default backend. Keys are the same strings the Redis backend uses, so
+    both are scoped identically and a bug in one shows up in the other."""
 
     def __init__(self) -> None:
-        self.sessions: dict[str, list[BaseMessage]] = {}
-        self.bindings: dict[str, str] = {}
-        self.actions: list[dict[str, Any]] = []
-        self.audit: list[dict[str, Any]] = []
-        # (count, expires_at_epoch_seconds) per rate-limit key.
+        self.strings: dict[str, str] = {}
+        self.lists: dict[str, list[str]] = {}
+        self.hashes: dict[str, dict[str, Any]] = {}
+        self.counters: dict[str, int] = {}
+        # (count, expires_at_epoch_seconds), keyed globally -- see docstring.
         self.rate_counters: dict[str, tuple[int, float]] = {}
 
-    def get_history(self, session_id: str) -> list[BaseMessage]:
-        return list(self.sessions.get(session_id, []))
+    # -- primitives --------------------------------------------------------
 
-    def set_history(self, session_id: str, messages: list[BaseMessage]) -> None:
-        self.sessions[session_id] = list(messages)
+    def _get(self, key: str) -> str | None:
+        return self.strings.get(key)
 
-    def get_bound_invoice(self, session_id: str) -> str | None:
-        return self.bindings.get(session_id)
+    def _set(self, key: str, value: str, nx: bool = False) -> None:
+        if nx and key in self.strings:
+            return
+        self.strings[key] = value
 
-    def bind_invoice(self, session_id: str, invoice_id: str) -> str:
-        return self.bindings.setdefault(session_id, invoice_id)
+    def _rpush(self, key: str, value: str) -> None:
+        self.lists.setdefault(key, []).append(value)
 
-    def session_count(self) -> int:
-        return len(self.sessions)
+    def _lrange(self, key: str) -> list[str]:
+        return list(self.lists.get(key, []))
 
-    def next_action_id(self) -> int:
-        return len(self.actions) + 1
+    def _hset(self, key: str, field: str, value: Any) -> None:
+        self.hashes.setdefault(key, {})[field] = value
 
-    def append_action(self, record: dict[str, Any]) -> None:
-        self.actions.append(record)
+    def _hgetall(self, key: str) -> dict[str, Any]:
+        return dict(self.hashes.get(key, {}))
 
-    def list_actions(self) -> list[dict[str, Any]]:
-        return list(self.actions)
+    def _incr(self, key: str) -> int:
+        self.counters[key] = self.counters.get(key, 0) + 1
+        return self.counters[key]
 
-    def append_audit(self, record: dict[str, Any]) -> None:
-        self.audit.append(record)
+    def _keys(self, pattern: str) -> list[str]:
+        head = pattern.rstrip("*")
+        out = []
+        for store in (self.strings, self.lists, self.hashes, self.counters):
+            out.extend(k for k in store if k.startswith(head))
+        return out
 
-    def list_audit(self) -> list[dict[str, Any]]:
-        return list(self.audit)
+    def _delete(self, keys: list[str]) -> None:
+        for store in (self.strings, self.lists, self.hashes, self.counters):
+            for k in keys:
+                store.pop(k, None)
+
+    # -- rate limiting (global, not demo-scoped) ---------------------------
 
     def incr_with_ttl(self, key: str, ttl_seconds: int) -> tuple[int, int]:
         import time
@@ -90,89 +120,78 @@ class _MemoryBackend:
         self.rate_counters[key] = (count, expires_at)
         return count, max(0, int(expires_at - now))
 
-    def reset(self) -> None:
-        self.sessions.clear()
-        self.bindings.clear()
-        self.actions.clear()
-        self.audit.clear()
+    def clear_all(self) -> None:
+        self.strings.clear()
+        self.lists.clear()
+        self.hashes.clear()
+        self.counters.clear()
 
 
 class _RedisBackedStore:
     """Shared logic for any client exposing the standard Redis command names.
 
-    Both connection shapes below expose an identical surface for the seven
-    commands used here (get/set/rpush/lrange/incr/expire/ttl/keys/delete), so
-    the storage logic lives here once; each subclass only builds the client.
+    Both connection shapes expose an identical surface for the commands used
+    here, so the storage logic lives here once; each subclass only builds the
+    client.
     """
 
     def __init__(self, client: Any) -> None:
         self._redis = client
 
-    @staticmethod
-    def _history_key(session_id: str) -> str:
-        return f"cleardue:history:{session_id}"
+    def _get(self, key: str) -> str | None:
+        return self._redis.get(key)
 
-    @staticmethod
-    def _binding_key(session_id: str) -> str:
-        return f"cleardue:binding:{session_id}"
+    def _set(self, key: str, value: str, nx: bool = False) -> None:
+        if nx:
+            self._redis.set(key, value, nx=True)
+        else:
+            self._redis.set(key, value)
 
-    def get_history(self, session_id: str) -> list[BaseMessage]:
-        raw = self._redis.get(self._history_key(session_id))
-        if not raw:
-            return []
-        return messages_from_dict(json.loads(raw))
+    def _rpush(self, key: str, value: str) -> None:
+        self._redis.rpush(key, value)
 
-    def set_history(self, session_id: str, messages: list[BaseMessage]) -> None:
-        self._redis.set(self._history_key(session_id), json.dumps(messages_to_dict(messages)))
+    def _lrange(self, key: str) -> list[str]:
+        return self._redis.lrange(key, 0, -1)
 
-    def get_bound_invoice(self, session_id: str) -> str | None:
-        return self._redis.get(self._binding_key(session_id))
+    def _hset(self, key: str, field: str, value: Any) -> None:
+        self._redis.hset(key, field, json.dumps(value))
 
-    def bind_invoice(self, session_id: str, invoice_id: str) -> str:
-        # NX: only takes effect if nothing is stored yet, matching the
-        # in-memory backend's setdefault semantics -- a session's bound
-        # invoice cannot be changed once set, by an attacker or otherwise.
-        self._redis.set(self._binding_key(session_id), invoice_id, nx=True)
-        return self._redis.get(self._binding_key(session_id))
+    def _hgetall(self, key: str) -> dict[str, Any]:
+        raw = self._redis.hgetall(key) or {}
+        out = {}
+        for k, v in raw.items():
+            try:
+                out[k] = json.loads(v)
+            except (TypeError, ValueError):
+                out[k] = v
+        return out
 
-    def session_count(self) -> int:
-        return len(self._redis.keys("cleardue:history:*"))
+    def _incr(self, key: str) -> int:
+        return int(self._redis.incr(key))
 
-    def next_action_id(self) -> int:
-        return int(self._redis.incr(_ACTION_SEQ_KEY))
+    def _keys(self, pattern: str) -> list[str]:
+        return list(self._redis.keys(pattern))
 
-    def append_action(self, record: dict[str, Any]) -> None:
-        self._redis.rpush(_ACTION_LOG_KEY, json.dumps(record))
-
-    def list_actions(self) -> list[dict[str, Any]]:
-        return [json.loads(r) for r in self._redis.lrange(_ACTION_LOG_KEY, 0, -1)]
-
-    def append_audit(self, record: dict[str, Any]) -> None:
-        self._redis.rpush(_AUDIT_LOG_KEY, json.dumps(record))
-
-    def list_audit(self) -> list[dict[str, Any]]:
-        return [json.loads(r) for r in self._redis.lrange(_AUDIT_LOG_KEY, 0, -1)]
+    def _delete(self, keys: list[str]) -> None:
+        if keys:
+            self._redis.delete(*keys)
 
     def incr_with_ttl(self, key: str, ttl_seconds: int) -> tuple[int, int]:
         # INCR is atomic across every serverless instance sharing this Redis,
-        # which a per-process in-memory counter could never be. EXPIRE is set
-        # only on the count's first increment (count == 1) so the window
-        # doesn't keep sliding forward on every request within it.
+        # which a per-process counter could never be. EXPIRE is set only on
+        # the first increment so the window doesn't slide forward forever.
         count = int(self._redis.incr(key))
         if count == 1:
             self._redis.expire(key, ttl_seconds)
         ttl = self._redis.ttl(key)
         return count, ttl if ttl and ttl > 0 else ttl_seconds
 
-    def reset(self) -> None:
-        keys = self._redis.keys("cleardue:history:*") + self._redis.keys("cleardue:binding:*")
-        if keys:
-            self._redis.delete(*keys)
-        self._redis.delete(_ACTION_LOG_KEY, _AUDIT_LOG_KEY, _ACTION_SEQ_KEY)
+    def clear_all(self) -> None:
+        self._delete(self._keys("demo:*"))
 
 
 class _RedisUrlBackend(_RedisBackedStore):
-    """Plain redis:// / rediss:// connection string -- the common marketplace shape."""
+    """Plain redis:// / rediss:// connection string."""
 
     def __init__(self, url: str) -> None:
         import redis  # imported lazily -- see module docstring
@@ -181,7 +200,7 @@ class _RedisUrlBackend(_RedisBackedStore):
 
 
 class _UpstashRestBackend(_RedisBackedStore):
-    """Upstash's REST API -- what "Vercel KV" used to inject."""
+    """Upstash's REST API."""
 
     def __init__(self, url: str, token: str) -> None:
         from upstash_redis import Redis  # imported lazily -- see module docstring
@@ -200,54 +219,106 @@ def _select_backend():
 _backend = _select_backend()
 
 
-def get_history(session_id: str) -> list[BaseMessage]:
-    return _backend.get_history(session_id)
+# ---------------------------------------------------------------------------
+# Conversation history + invoice binding
+# ---------------------------------------------------------------------------
 
 
-def set_history(session_id: str, messages: list[BaseMessage]) -> None:
-    _backend.set_history(session_id, messages)
+def get_history(conversation_id: str) -> list[BaseMessage]:
+    raw = _backend._get(_k(f"history:{conversation_id}"))
+    if not raw:
+        return []
+    return messages_from_dict(json.loads(raw))
 
 
-def get_bound_invoice(session_id: str) -> str | None:
-    return _backend.get_bound_invoice(session_id)
+def set_history(conversation_id: str, messages: list[BaseMessage]) -> None:
+    _backend._set(_k(f"history:{conversation_id}"), json.dumps(messages_to_dict(messages)))
 
 
-def bind_invoice(session_id: str, invoice_id: str) -> str:
-    return _backend.bind_invoice(session_id, invoice_id)
+def get_bound_invoice(conversation_id: str) -> str | None:
+    return _backend._get(_k(f"binding:{conversation_id}"))
+
+
+def bind_invoice(conversation_id: str, invoice_id: str) -> str:
+    # NX: a conversation's bound invoice cannot be changed once set, by an
+    # attacker or otherwise.
+    key = _k(f"binding:{conversation_id}")
+    _backend._set(key, invoice_id, nx=True)
+    return _backend._get(key)
 
 
 def session_count() -> int:
-    return _backend.session_count()
+    return len(_backend._keys(_k("history:*")))
+
+
+# ---------------------------------------------------------------------------
+# Action log (ground truth) + policy audit log
+# ---------------------------------------------------------------------------
 
 
 def next_action_id() -> int:
-    return _backend.next_action_id()
+    return _backend._incr(_k("action_seq"))
 
 
 def append_action(record: dict[str, Any]) -> None:
-    _backend.append_action(record)
+    _backend._rpush(_k("action_log"), json.dumps(record))
 
 
 def list_actions() -> list[dict[str, Any]]:
-    return _backend.list_actions()
+    return [json.loads(r) for r in _backend._lrange(_k("action_log"))]
 
 
 def append_audit(record: dict[str, Any]) -> None:
-    _backend.append_audit(record)
+    _backend._rpush(_k("audit_log"), json.dumps(record))
 
 
 def list_audit() -> list[dict[str, Any]]:
-    return _backend.list_audit()
+    return [json.loads(r) for r in _backend._lrange(_k("audit_log"))]
+
+
+# ---------------------------------------------------------------------------
+# Per-session overlay on the static ledger
+# ---------------------------------------------------------------------------
+
+
+def set_invoice_status(invoice_id: str, status: str) -> None:
+    _backend._hset(_k("invoice_status"), invoice_id, status)
+
+
+def invoice_status_overlay() -> dict[str, str]:
+    return _backend._hgetall(_k("invoice_status"))
+
+
+def set_consent(customer_id: str, consent: bool) -> None:
+    _backend._hset(_k("consent"), customer_id, bool(consent))
+
+
+def consent_overlay() -> dict[str, bool]:
+    return _backend._hgetall(_k("consent"))
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting (global) + resets
+# ---------------------------------------------------------------------------
 
 
 def incr_with_ttl(key: str, ttl_seconds: int) -> tuple[int, int]:
-    """Increment a fixed-window counter, returning (new_count, seconds_left).
-
-    Used by rate_limit.py. Deliberately not touched by reset() below --
-    clearing demo state shouldn't also reset abuse-protection counters.
-    """
+    """Fixed-window counter. Deliberately NOT demo-scoped -- see module docstring."""
     return _backend.incr_with_ttl(key, ttl_seconds)
 
 
+def clear_scope(scope: str | None = None) -> int:
+    """Delete every key belonging to one demo session. Returns the count."""
+    keys = _backend._keys(f"{_prefix(scope)}:*")
+    _backend._delete(keys)
+    return len(keys)
+
+
 def reset() -> None:
-    _backend.reset()
+    """Clear the caller's own demo session."""
+    clear_scope()
+
+
+def reset_all() -> None:
+    """Clear every demo session. Operator-only -- see /debug/reset."""
+    _backend.clear_all()

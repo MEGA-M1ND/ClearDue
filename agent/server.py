@@ -12,7 +12,7 @@ import os
 import secrets
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -22,6 +22,7 @@ from policy_engine.core import list_audit_log, use_audit_backend
 from . import agent as agent_module
 from . import mcp_runtime
 from . import mock_ledger
+from . import session
 from . import rate_limit
 from . import store
 
@@ -74,7 +75,8 @@ def _client_ip(request: Request) -> str:
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest, request: Request) -> ChatResponse:
+def chat(req: ChatRequest, request: Request, response: Response) -> ChatResponse:
+    session.bind(request, response)
     try:
         rate_limit.check_chat_rate_limit(_client_ip(request))
     except rate_limit.RateLimitExceeded as e:
@@ -93,7 +95,8 @@ def chat(req: ChatRequest, request: Request) -> ChatResponse:
 
 
 @app.get("/health")
-def health() -> dict[str, Any]:
+def health(request: Request, response: Response) -> dict[str, Any]:
+    session.bind(request, response)
     provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
     model = os.getenv("OPENAI_MODEL", agent_module.DEFAULT_OPENAI_MODEL)
     return {
@@ -130,18 +133,20 @@ def _check_debug_token(x_debug_token: str | None) -> None:
 
 
 @app.get("/debug/action_log")
-def debug_action_log() -> dict[str, Any]:
+def debug_action_log(request: Request, response: Response) -> dict[str, Any]:
+    session.bind(request, response)
     actions = mock_ledger.list_actions()
     return {"count": len(actions), "actions": actions}
 
 
 @app.get("/debug/ledger")
-def debug_ledger() -> dict[str, Any]:
-    """Current invoice/customer state, so the adversary suite can score
-    violations mechanically (e.g. "was a payment link created for more than
-    the invoice's outstanding amount") instead of hand-computing expected
-    values that could drift out of sync with mock_ledger.py."""
-    return {"invoices": dict(mock_ledger.INVOICES), "customers": dict(mock_ledger.CUSTOMERS)}
+def debug_ledger(request: Request, response: Response) -> dict[str, Any]:
+    """Current invoice/customer state as *this visitor* sees it, so the
+    adversary suite can score violations mechanically instead of
+    hand-computing expected values that could drift out of sync with
+    mock_ledger.py. Reflects the caller's own overlay, not global state."""
+    session.bind(request, response)
+    return {"invoices": mock_ledger.all_invoices(), "customers": mock_ledger.all_customers()}
 
 
 @app.get("/debug/policy")
@@ -152,11 +157,12 @@ def debug_policy() -> dict[str, Any]:
 
 
 @app.get("/debug/policy_log")
-def debug_policy_log() -> dict[str, Any]:
+def debug_policy_log(request: Request, response: Response) -> dict[str, Any]:
     """Every policy decision -- allowed AND denied -- not just the actions
     that actually happened. mock_ledger's action_log only ever records
     completed actions; this is what makes the audit trail "full" rather than
     survivorship-biased, per Razorpay's own stated Agent Studio principle."""
+    session.bind(request, response)
     entries = list_audit_log()
     return {"count": len(entries), "entries": entries}
 
@@ -180,18 +186,32 @@ def debug_mcp() -> dict[str, Any]:
     }
 
 
+@app.post("/api/reset")
+def api_reset(request: Request, response: Response) -> dict[str, Any]:
+    """Clear the caller's own demo state, and only theirs.
+
+    No token required, unlike /debug/reset -- this can only ever touch keys
+    under the caller's own demo session, so there is nothing to protect
+    against. It is also what makes the public demo self-serve: a visitor can
+    always get back to a clean invoice without an operator's credentials.
+
+    Invoice status and consent revert automatically, because those live in
+    the per-session overlay this deletes rather than in mutated globals.
+    """
+    scope = session.bind(request, response)
+    cleared = store.clear_scope(scope)
+    mcp_runtime.reset()
+    return {"reset": True, "session_id": scope, "cleared_keys": cleared}
+
+
 @app.post("/debug/reset")
 def debug_reset(x_debug_token: str | None = Header(default=None)) -> dict[str, Any]:
+    """Operator-level reset: clears EVERY demo session, not just the caller's.
+
+    Token-gated because it destroys other visitors' in-flight demos. Most
+    callers want /api/reset instead.
+    """
     _check_debug_token(x_debug_token)
-    mock_ledger.reset()  # clears action_log, audit_log, session history, and bindings via store.reset()
+    store.reset_all()
     mcp_runtime.reset()
-    # Undo any in-memory ledger mutations from mark_paid/revoke_consent so
-    # each run starts from the same known state.
-    for inv in mock_ledger.INVOICES.values():
-        if inv["invoice_id"] != "INV1004":
-            inv["status"] = "open"
-        else:
-            inv["status"] = "disputed"
-    for cust_id, cust in mock_ledger.CUSTOMERS.items():
-        cust["consent_given"] = cust_id != "CUST005"
-    return {"status": "reset"}
+    return {"status": "reset", "scope": "all sessions"}

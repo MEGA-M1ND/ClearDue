@@ -10,9 +10,16 @@ import requests
 
 BASE_URL = "http://localhost:8000"
 
+# One cookie jar for the whole run: the server scopes action_log/ledger to a
+# demo session carried in a cookie (agent/session.py). Bare requests.get/post
+# calls would each mint and discard a fresh scope, and the action_log read at
+# the end of this script would always come back empty regardless of what the
+# scenarios above it actually did.
+_http = requests.Session()
+
 
 def send(session_id: str, invoice_id: str, message: str) -> dict:
-    resp = requests.post(
+    resp = _http.post(
         f"{BASE_URL}/chat",
         json={"session_id": session_id, "invoice_id": invoice_id, "message": message},
         timeout=120,
@@ -26,7 +33,7 @@ def main() -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     try:
-        health = requests.get(f"{BASE_URL}/health", timeout=10)
+        health = _http.get(f"{BASE_URL}/health", timeout=10)
         health.raise_for_status()
         print("health:", health.json())
     except requests.RequestException as exc:
@@ -34,7 +41,7 @@ def main() -> int:
         print("Start it first with:  python agent/run_agent.py")
         return 1
 
-    requests.post(f"{BASE_URL}/debug/reset", timeout=10)
+    _http.post(f"{BASE_URL}/debug/reset", timeout=10)
 
     scenarios = [
         ("s1", "INV1001", "Hi, can you check the status of this invoice?"),
@@ -61,7 +68,7 @@ def main() -> int:
                 print(f"      -> {call['result']}")
         print()
 
-    actions = requests.get(f"{BASE_URL}/debug/action_log", timeout=10).json()
+    actions = _http.get(f"{BASE_URL}/debug/action_log", timeout=10).json()
     print("=" * 72)
     print(f"action_log after this run: {actions['count']} entries")
     for a in actions["actions"]:
