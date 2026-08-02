@@ -8,6 +8,7 @@ single in-memory process) is the one source of truth for everything a
 Vercel deployment needs to survive across serverless instances.
 """
 
+import json
 import os
 import secrets
 from typing import Any
@@ -24,6 +25,7 @@ from . import escalation
 from . import mcp_runtime
 from . import merchant_policy_store
 from . import mock_ledger
+from . import razorpay_reconciler
 from . import session
 from . import rate_limit
 from . import store
@@ -379,3 +381,94 @@ def reject_escalation(
     if case is None:
         raise HTTPException(status_code=404, detail=f"no case {case_id!r} in this session")
     return case
+
+
+# ---------------------------------------------------------------------------
+# Razorpay webhook reconciliation -- Phase 4. See agent/razorpay_reconciler.py
+# for the three real architectural corrections from how this was originally
+# scoped (obligation-ledger commit timing, the global link-owner reverse
+# index a webhook needs since it carries no demo-session cookie, and why
+# this does a single on-demand check instead of a 90-second polling loop).
+# ---------------------------------------------------------------------------
+
+_RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
+
+
+@app.post("/api/webhooks/razorpay")
+async def razorpay_webhook(request: Request) -> dict[str, Any]:
+    """Razorpay calls this directly -- no browser, no demo-session cookie.
+    Deliberately does NOT follow this project's "unset secret means fully
+    open" convention (used everywhere else: DEBUG_TOKEN, ADMIN_API_KEY).
+    An unsigned webhook here is a directly exploitable payment-fraud vector
+    -- anyone who finds this URL could POST a fake "payment_link.paid" event
+    and get an invoice marked paid on a claim that was never verified by
+    Razorpay at all. mark_paid's own guardrail exists specifically because
+    "a claim of payment is not proof of payment" -- trusting an unsigned
+    webhook would quietly reintroduce exactly what that guardrail prevents,
+    through a side door. There is also no need to accept the risk: real
+    Razorpay mode already has a secret-free fallback (the on-demand check in
+    razorpay_reconciler.check_now_for_invoice), so refusing unsigned
+    webhooks costs nothing.
+    """
+    raw_body = await request.body()
+
+    if not _RAZORPAY_WEBHOOK_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "RAZORPAY_WEBHOOK_SECRET is not configured, so this endpoint refuses to "
+                "process webhooks -- an unsigned 'payment confirmed' claim is not proof "
+                "of payment. Real-mode invoices can still be reconciled via mark_paid's "
+                "own on-demand check."
+            ),
+        )
+
+    signature = request.headers.get("X-Razorpay-Signature", "")
+    if not razorpay_reconciler.verify_webhook_signature(raw_body, signature, _RAZORPAY_WEBHOOK_SECRET):
+        raise HTTPException(status_code=401, detail="invalid webhook signature")
+
+    try:
+        payload = json.loads(raw_body)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+
+    event = razorpay_reconciler.parse_payment_link_paid_event(payload)
+    if event is None:
+        return {"status": "ignored", "reason": "not a payment_link.paid event"}
+
+    owner = razorpay_reconciler.find_link_owner(event["link_id"])
+    if owner is None:
+        return {"status": "ignored", "reason": "no known owner for this payment_link_id"}
+
+    # A webhook has no session of its own to bind -- explicitly operate
+    # within the visitor's scope that actually created this link, found via
+    # the reverse index note_link_owner wrote at creation time.
+    session.set_current(owner)
+    invoice_id = next(
+        (
+            a["invoice_id"] for a in mock_ledger.list_actions()
+            if a.get("action_type") == "payment_link_created"
+            and a.get("razorpay_link_id") == event["link_id"]
+        ),
+        None,
+    )
+    if invoice_id is None:
+        return {"status": "ignored", "reason": "link not found in the owning session's action log"}
+
+    invoice = mock_ledger.get_invoice(invoice_id)
+    outstanding = invoice["amount"] if invoice else event["amount_paid"]
+    confirmation = razorpay_reconciler.record_confirmation(
+        invoice_id, event["link_id"], event["payment_id"], event["amount_paid"], outstanding
+    )
+    return {"status": "recorded", "confirmation": confirmation}
+
+
+@app.get("/api/reconciliation")
+def list_reconciliation(request: Request, response: Response) -> dict[str, Any]:
+    """The caller's own verification receipts -- ground truth for how (and
+    whether) each of their invoices came to be considered paid. Scoped by
+    the caller's demo-session cookie, same isolation rule as /api/receipts
+    and /api/escalations."""
+    session.bind(request, response)
+    receipts = razorpay_reconciler.list_verification_receipts()
+    return {"count": len(receipts), "receipts": receipts}

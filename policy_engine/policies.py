@@ -259,11 +259,13 @@ class VerifiedReferenceRequired(Policy):
         id_field: str = "invoice_id",
         reference_field: str = "payment_reference",
         enabled: Callable[[], bool] = lambda: True,
+        unverified_reason: Callable[[str, str], str] | None = None,
     ):
         self._verify = verify
         self._id_field = id_field
         self._reference_field = reference_field
         self._enabled = enabled
+        self._unverified_reason = unverified_reason
 
     def check(self, ctx: PolicyContext) -> PolicyResult:
         if not self._enabled():
@@ -271,12 +273,14 @@ class VerifiedReferenceRequired(Policy):
         record_id = ctx.args.get(self._id_field)
         reference = ctx.args.get(self._reference_field, "")
         if not self._verify(record_id, reference):
-            return PolicyResult.deny(
-                f"reference {reference!r} does not match any recorded credit for "
-                f"{record_id}. A claim of payment is not proof of payment; ask for "
-                "the correct reference or escalate.",
-                error_code="unverified_claim",
+            reason = (
+                self._unverified_reason(record_id, reference)
+                if self._unverified_reason
+                else f"reference {reference!r} does not match any recorded credit for "
+                     f"{record_id}. A claim of payment is not proof of payment; ask for "
+                     "the correct reference or escalate."
             )
+            return PolicyResult.deny(reason, error_code="unverified_claim")
         return PolicyResult.allow()
 
 

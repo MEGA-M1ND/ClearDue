@@ -28,7 +28,8 @@ _KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 _KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
 USING_REAL_RAZORPAY = bool(_KEY_ID and _KEY_SECRET)
 
-_API_URL = "https://api.razorpay.com/v1/payment_links"
+_API_ROOT = "https://api.razorpay.com/v1"
+_API_URL = f"{_API_ROOT}/payment_links"
 
 
 class PaymentLinkError(Exception):
@@ -62,3 +63,23 @@ def create_payment_link(invoice_id: str, amount: float, currency: str) -> dict[s
 
     body = resp.json()
     return {"id": body["id"], "short_url": body["short_url"]}
+
+
+def get_payment_link(link_id: str) -> dict[str, Any]:
+    """GET /v1/payment_links/{id} -- the read side create_payment_link's
+    write didn't need until agent/razorpay_reconciler.py's on-demand status
+    check (a live look at whether a link has actually been paid, for when
+    no webhook is configured to say so proactively)."""
+    try:
+        resp = requests.get(f"{_API_ROOT}/payment_links/{link_id}", headers=_auth_header(), timeout=15)
+    except requests.RequestException as e:
+        raise PaymentLinkError(f"could not reach Razorpay: {e}") from e
+
+    if resp.status_code >= 400:
+        try:
+            detail = resp.json().get("error", {}).get("description", resp.text)
+        except ValueError:
+            detail = resp.text
+        raise PaymentLinkError(f"Razorpay rejected the request ({resp.status_code}): {detail}")
+
+    return resp.json()

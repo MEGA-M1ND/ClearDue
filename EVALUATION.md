@@ -155,6 +155,77 @@ not a silently-empty result. `mcp_gateway/gateway.py`'s execution records now al
 `receipt_id` of the specific `ALLOW` decision that authorized them, confirmed by asserting
 the two match on a live gateway call.
 
+### Payment confirmation is now reconciled against Razorpay, not a hardcoded list
+
+Before this, `mark_paid` in mock mode checked a hardcoded five-entry reference list, and
+in real-Razorpay mode had no way to check at all -- any string a customer typed as a
+"payment reference" was accepted at face value. `agent/razorpay_reconciler.py` +
+`POST /api/webhooks/razorpay` close that: `mark_paid` now requires a reference that
+matches a payment Razorpay itself confirmed, via `VerifiedReferenceRequired`.
+
+Three real corrections from how this task was originally scoped, found by checking the
+actual code before building against it (full reasoning in the module docstring):
+
+1. **Webhook confirmation is not the same event as `obligation_ledger.commit()`.**
+   `commit()` already fires at link-*creation* time (`agent/agent.py`'s
+   `create_payment_link`), the moment the Razorpay API call succeeds -- because that's
+   when exposure becomes real, not when someone eventually pays. The webhook confirms a
+   *different* fact (money was actually received), so this phase adds a separate concept
+   -- `razorpay_reconciler.record_confirmation()` -- rather than repurposing `commit()`,
+   which stays untouched.
+2. **"Poll every 30 seconds, up to 3 times" would block an HTTP request handler for up to
+   90 seconds** -- replaced with a single synchronous on-demand check
+   (`check_now_for_invoice`), run exactly when `mark_paid` needs an answer and no webhook
+   secret is configured, rather than a fixed schedule nothing else is watching.
+3. **Webhooks carry no session cookie.** ClearDue's entire storage model is scoped per
+   visitor (`demo:{session_id}:*`) via `agent/session.py`, but a server-to-server webhook
+   has no way to present one. A small **global** (deliberately not demo-scoped) reverse
+   index -- `link_owner:{razorpay_link_id} -> session_id`, written the instant a real link
+   is created -- lets the webhook handler find the right visitor's scope. Same category of
+   deliberate exception as the merchant-policy store and the rate limiter; still narrow,
+   still documented, never a casual precedent.
+
+**A fourth deviation, deliberate, from an established convention:** every other
+token-gated endpoint in this project (`DEBUG_TOKEN`, `ADMIN_API_KEY`) treats an unset
+secret as "open" -- fine for a public reset button or, with real trade-offs accepted, even
+for policy edits. `POST /api/webhooks/razorpay` does **not** follow that pattern: with no
+`RAZORPAY_WEBHOOK_SECRET` configured it returns `503`, refusing to process *any* webhook
+body, signed or not. An unsigned "payment confirmed" claim is a direct payment-fraud
+vector -- anyone who discovers the URL could POST a fake `payment_link.paid` event and
+get an invoice marked paid with no money having moved. Unlike the admin/debug endpoints,
+there's no cost to refusing outright: the on-demand check (`check_now_for_invoice`)
+already exists as a secret-free fallback, so nothing is lost by not accepting unsigned
+webhooks.
+
+Verified live, end-to-end, over real HTTP against a real Razorpay test-mode link:
+
+- Signature verification: correct signature accepted; tampered body rejected; wrong
+  secret rejected; a non-`payment_link.paid` event type correctly ignored without error.
+- `POST /api/webhooks/razorpay` with no `RAZORPAY_WEBHOOK_SECRET` configured → `503`; with
+  a secret configured but a missing or wrong `X-Razorpay-Signature` → `401` (both cases
+  tested independently).
+- A real chat turn created a real Razorpay test-mode payment link for `INV1006`; a
+  correctly-signed `payment_link.paid` webhook payload referencing that exact
+  `razorpay_link_id` was POSTed; the response correctly identified `INV1006` as the
+  invoice purely from the global link-owner index and that owning session's own action
+  log -- proving multi-tenant routing works with nothing but the webhook payload as input.
+- `GET /api/reconciliation` on the *same* visitor's session shows the confirmation; a
+  *different* visitor's session shows `{"count": 0, "receipts": []}` -- the same
+  cross-session isolation guarantee every other endpoint in this project gets, verified
+  again here rather than assumed.
+- `mark_paid`, called over the real `/chat` HTTP path with the webhook-confirmed
+  `payment_id` as the reference, now succeeds; mock-mode backward compatibility is
+  unchanged (`INV1006`'s hardcoded reference still works; `INV1002`'s
+  `false_payment_claim` is still correctly rejected).
+- The on-demand check (`check_payment_link_status_now`) correctly returns "not paid" for
+  a genuine, currently-unpaid real test-mode link -- no false positive.
+
+**Honest limitation, stated plainly:** signature verification is implemented against
+Razorpay's documented HMAC-SHA256 scheme and tested against self-signed payloads built
+the same way. There is no way, from this environment, to trigger a *real*
+Razorpay-originated webhook -- that requires configuring a live webhook URL in a Razorpay
+dashboard this process has no access to. That gap is real, not glossed over.
+
 ### A note on these goals vs. the adversary suite
 
 The seven goals above are **product scenarios** — deterministic paths a reviewer can click
@@ -254,8 +325,13 @@ visitor a clean invoice.
 
 ## Known limitations
 
-- **No payment reconciliation.** `mark_paid` checks a hard-coded reference list, not real
-  Razorpay payment status, so a genuinely paid link doesn't auto-close its invoice.
+- **Webhook signature verification is untested against a real Razorpay-originated
+  webhook** -- only against self-signed payloads built the same documented way, since
+  triggering a genuine one requires dashboard access this environment doesn't have.
+- **Reconciliation only exists for `create_payment_link`'s own links.** There's no
+  reconciliation path for a settlement negotiated outside a payment link, and no handling
+  for `payment_link.partially_paid` or `payment_link.expired` Razorpay event types --
+  only `payment_link.paid` is parsed.
 - **Genuine multi-tenancy doesn't exist.** `MerchantPolicy` is real, versioned, and live
   -- but every invoice in `mock_ledger.py` still belongs to the one seeded
   `MERCHANT_DEFAULT`. A second merchant is a second `seed()` call away, but nothing

@@ -76,6 +76,7 @@ from . import merchant_policy_store
 from . import mock_ledger
 from . import obligation
 from . import razorpay_client
+from . import razorpay_reconciler
 
 load_dotenv()
 
@@ -490,6 +491,11 @@ def create_payment_link(
             "payment_link_created", invoice_id, amount=amount, currency=invoice["currency"],
             razorpay_link_id=link["id"],
         )
+        # A webhook arrives with no demo-session cookie attached (it's a
+        # server-to-server callback, not a browser request) -- this is how
+        # razorpay_reconciler later finds which visitor's scope to write the
+        # confirmation into. See its module docstring.
+        razorpay_reconciler.note_link_owner(link["id"])
     else:
         link_id = uuid.uuid4().hex[:10]
         url = f"https://pay.cleardue.test/link/{link_id}?amount={amount}"
@@ -503,6 +509,37 @@ def create_payment_link(
     return f"Payment link created ({record['action_id']}): {url}"
 
 
+def _verify_payment(invoice_id: str, reference: str) -> bool:
+    """Two independent sources of truth, either is sufficient:
+
+    1. mock_ledger's hardcoded reference list -- unchanged from every prior
+       phase, so the mock-mode demo (and the adversary suite's
+       false_payment_claim goal, which specifically targets an invoice with
+       NO valid entry in that list) keeps working exactly as before.
+    2. razorpay_reconciler -- a REAL webhook-confirmed payment, or (with no
+       webhook configured) a live on-demand check against Razorpay itself.
+       This is the actual replacement for "trust a hardcoded list": a
+       customer's claim is only as good as what Razorpay reports back.
+    """
+    return mock_ledger.verify_payment_reference(
+        invoice_id, reference
+    ) or razorpay_reconciler.verify_payment_reference(invoice_id, reference)
+
+
+def _unverified_payment_reason(invoice_id: str, reference: str) -> str:
+    if razorpay_client.USING_REAL_RAZORPAY:
+        return (
+            f"no verified payment found for {invoice_id} -- reference {reference!r} does "
+            "not match anything Razorpay has confirmed. Waiting for Razorpay webhook "
+            "confirmation (or ask the customer to double check the reference)."
+        )
+    return (
+        f"reference {reference!r} does not match any recorded credit for "
+        f"{invoice_id}. A claim of payment is not proof of payment; ask for "
+        "the correct reference or escalate."
+    )
+
+
 @tool
 @guarded(
     policies=[
@@ -510,7 +547,9 @@ def create_payment_link(
         RecordMustExist(get_record=mock_ledger.get_invoice),
         SessionBound(enabled=_authz_enabled),
         VerifiedReferenceRequired(
-            verify=mock_ledger.verify_payment_reference, enabled=_guardrails_enabled
+            verify=_verify_payment,
+            enabled=_guardrails_enabled,
+            unverified_reason=_unverified_payment_reason,
         ),
     ],
     rejection_prefix="NOT MARKED PAID",
@@ -519,11 +558,18 @@ def mark_paid(
     invoice_id: str, payment_reference: str, state: Annotated[dict, InjectedState]
 ) -> str:
     """Mark an invoice as paid. Requires a verifiable payment reference -- a customer's word is not enough."""
+    # A real, webhook/reconciler-confirmed payment might be for LESS than
+    # the full outstanding amount -- use its actual status rather than
+    # always assuming "paid" the way the mock-reference path always has.
+    confirmed = razorpay_reconciler.get_confirmed_payment(invoice_id)
+    status = confirmed["status"] if confirmed else "paid"
     # Writes to this visitor's overlay, not the shared INVOICES dict -- see
     # mock_ledger's read section for why.
-    mock_ledger.set_invoice_status(invoice_id, "paid")
-    record = mock_ledger.log_action("marked_paid", invoice_id, payment_reference=payment_reference)
-    return f"Invoice {invoice_id} marked paid ({record['action_id']})."
+    mock_ledger.set_invoice_status(invoice_id, status)
+    record = mock_ledger.log_action(
+        "marked_paid", invoice_id, payment_reference=payment_reference, status=status
+    )
+    return f"Invoice {invoice_id} marked {status} ({record['action_id']})."
 
 
 @tool

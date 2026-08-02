@@ -16,7 +16,7 @@ the seven evaluation goals with honest build status, and the before/after red-te
 | 1 — Reviewer build + guided demo flow | ✅ done |
 | 2 — Obligation ledger (cross-tool stacking) | ✅ done |
 | 3 — Merchant policy profiles + versioned decisions | ✅ done |
-| 4 — Razorpay webhook reconciliation | ⬜ not started |
+| 4 — Razorpay webhook reconciliation | ✅ done |
 | 5 — Evaluation page + policy simulation | ⬜ not started |
 
 ---
@@ -250,6 +250,24 @@ writeup, including the two places this deliberately deviates from `mcp_gateway/g
 having a stake in this (it doesn't -- Razorpay's real tool schema has no invoice concept
 to key an obligation ledger against), is in [EVALUATION.md](EVALUATION.md).
 
+### Payment confirmation is now reconciled against Razorpay, not a hardcoded list
+
+`mark_paid` used to accept any string a customer typed as a "payment reference," checked
+(in mock mode only) against a hardcoded five-entry list. `agent/razorpay_reconciler.py` +
+`POST /api/webhooks/razorpay` add real reconciliation: a reference now has to match a
+payment Razorpay itself confirmed, whether that arrives via a signed webhook
+(`payment_link.paid`) or a single on-demand `GET /v1/payment_links/{id}` check when no
+webhook secret is configured. Verified end-to-end against a real Razorpay test-mode link:
+a correctly-signed webhook payload routed itself to the exact right invoice using nothing
+but a global `link_id -> session_id` reverse index (webhooks carry no session cookie),
+and `mark_paid` then succeeded over the real `/chat` path using the webhook-confirmed
+payment id. `POST /api/webhooks/razorpay` refuses (`503`) if no webhook secret is
+configured at all -- unlike this project's other token-gated endpoints, an unsigned
+"payment confirmed" claim is a direct fraud vector with no offsetting cost to refusing it,
+since the on-demand check already covers the no-webhook case. Full writeup, including why
+this does *not* touch `obligation_ledger.commit()` (that already fires at link-creation,
+a genuinely different event from payment confirmation), is in [EVALUATION.md](EVALUATION.md).
+
 ---
 
 ## Repository layout
@@ -261,13 +279,17 @@ agent/
   agent.py           LangGraph agent, 8 tools, all guardrails declared via policy_engine,
                      resolved LIVE from merchant_policy_store on every check
   server.py          FastAPI: /, /chat, /health, /debug/*, /api/reset, /api/policy,
-                     /api/receipts, /api/escalations
+                     /api/receipts, /api/escalations, /api/webhooks/razorpay,
+                     /api/reconciliation
   session.py         the httpOnly demo-session cookie every request is scoped by
   store.py           Redis (or in-memory) storage, every key namespaced per session --
                      except merchant policy, deliberately global (see merchant_policy_store.py)
   obligation.py       wires policy_engine's ledger to store.py's primitives
   merchant_policy_store.py  wires policy_engine's MerchantPolicyStore to store.py's globals
   escalation.py       the human review queue -- EscalationCase, create/list/approve/reject
+  razorpay_client.py  real Razorpay Payment Links API -- create + get-status
+  razorpay_reconciler.py  webhook verification, payment confirmation, global link-owner
+                     reverse index, single on-demand status check
   run_agent.py       entry point
   manual_test.py     benign sanity check
 
