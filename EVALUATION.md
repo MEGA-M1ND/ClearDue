@@ -150,8 +150,39 @@ version of the reserve-before-execute payoff `create_payment_link`'s real-Razorp
 already relied on). `CLEARDUE_GUARDRAILS=off` correctly disables this check too, not just the
 native-tool ones — the demo's off-switch has to reproduce the real failure mode on every path
 uniformly or it's misrepresenting what "off" means. Full regression suite:
-`adversary/tests/test_mcp_obligation_mapping.py` (11 tests, no live server or MCP subprocess
+`adversary/tests/test_mcp_obligation_mapping.py` (12 tests, no live server or MCP subprocess
 required — the gateway is exercised directly against a stub transport).
+
+**Re-verified end-to-end against the REAL Razorpay MCP tool set, not just the stub above**
+(`CLEARDUE_MCP=on`, real test-mode keys, a real `gpt-5.2` chat turn explicitly directed to
+call `razorpay_create_payment_link`): the same 10%-then-full-value sequence, run for real,
+produced the identical `COLLECTION_BUDGET_EXCEEDED` denial, confirmed via `GET /debug/mcp`
+showing `"executed": []` — proving the model genuinely invoked the real MCP tool and the
+gateway stopped it before Razorpay's API was ever reached, not merely that a stub agreed with
+itself.
+
+That live run also found a real bug this project's own stub tests couldn't have caught, because
+they never exercise the actual MCP error-signalling path: asking for an amount Razorpay's own
+test account rejects (`HTTP 400: amount exceeds maximum amount allowed`) came back through the
+MCP protocol as an ordinary successful-looking text result, not a raised exception --
+`razorpay_mcp/server.py` never set `CallToolResult.isError=True` on a tool-level failure, so
+`MCPConnection.call()` had no way to know the call hadn't actually succeeded. The gateway
+committed the reservation anyway, permanently (and wrongly) consuming the invoice's entire
+remaining budget on a payment link that was never created — confirmed live: a subsequent,
+perfectly ordinary ₹5,000 request was denied with `0.00 available`, on an invoice that had
+₹108,000 of real headroom.
+
+Fixed at the actual root, not patched around: `razorpay_mcp/server.py` now sets `isError=True`
+on its `CallToolResult` for a Razorpay-side failure (the MCP protocol's own, correct way to
+signal this -- it never did before), and `MCPConnection.call()` now checks that field and
+raises a dedicated `MCPToolError`, which `PolicyGateway.call()` catches specifically to release
+the reservation and return a normal (non-raising) result -- preserving exactly what the model
+already saw for this case, while now correctly *not* committing a reservation for something
+that never happened. Re-run live after the fix, same exact scenario: the failed ₹108,000
+attempt released its reservation, and the following ₹5,000 request succeeded, creating a real
+Razorpay test-mode payment link (confirmed via its full returned object) with exactly one entry
+in the execution receipt log. Regression test added:
+`test_tool_level_failure_releases_and_does_not_raise`.
 
 **Honest scope limit, stated plainly:** only `create_payment_link` is mapped — the one
 money-moving tool ClearDue's own MCP allowlist (`agent/mcp_rules.py`) permits at all; refunds

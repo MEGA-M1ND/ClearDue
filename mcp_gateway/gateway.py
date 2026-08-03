@@ -33,7 +33,7 @@ from typing import Any, Callable, Protocol
 
 from policy_engine.core import Policy, PolicyContext, PolicyResult, record_decision
 
-from .connection import MCPConnection
+from .connection import MCPConnection, MCPToolError
 
 
 @dataclass
@@ -231,10 +231,29 @@ class PolicyGateway:
         # Only now does anything touch the transport.
         try:
             text = self._conn.call(tool_name, args)
+        except MCPToolError as e:
+            # Found live, the hard way: the transport worked and the server
+            # answered, but the tool itself failed (Razorpay rejecting the
+            # amount, an unknown id, ...) -- an ordinary, expected outcome,
+            # not a broken session. The reservation still has to be released
+            # (nothing was actually created), but this must NOT raise -- every
+            # caller of this method (langchain_tools.py's _call, in
+            # particular) has always gotten a plain string back for anything
+            # short of a genuinely dead connection, and changing that here
+            # would surface an ordinary Razorpay rejection as a Python
+            # exception three layers away from where it happened.
+            if handle is not None:
+                self._obligation.release(handle)
+            exec_receipt = record_decision(
+                f"mcp:{tool_name}", args, PolicyResult.allow(), "ExecutedWithToolError"
+            )
+            return GatewayDecision(
+                allowed=True, tool=tool_name, args=args, text=str(e), receipt_id=exec_receipt.receipt_id
+            )
         except Exception:
-            # The reservation outlived the call it was authorizing. Give the
-            # budget back rather than leaving this record's exposure
-            # permanently inflated by a call that never happened.
+            # A genuine transport failure (dead session, timeout) -- nothing
+            # a caller can react to as a normal result; keeps its original,
+            # unchanged behaviour of propagating.
             if handle is not None:
                 self._obligation.release(handle)
             raise

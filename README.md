@@ -348,7 +348,8 @@ adversary/
   tests/
     test_obligation_stacking.py       obligation ledger regression suite (pytest)
     test_mcp_obligation_mapping.py    cross-path stacking (native + real MCP rail),
-                                       fail-closed resolution, transport-failure rollback
+                                       fail-closed resolution, transport- and tool-level
+                                       failure rollback
 
 public/
   index.html          chat UI -- scenario stepper, invoice picker, two-tab log panel
@@ -407,7 +408,18 @@ own obligation ledger via the session's injected invoice binding — the same bi
 model can't see or spoof — and reserves against it exactly like the native tools do,
 before the transport call, releasing on failure. A 10% discount committed natively, then a
 full-value link attempted on the real Razorpay rail: denied, `COLLECTION_BUDGET_EXCEEDED`,
-before that call ever left this process. Full writeup in [EVALUATION.md](EVALUATION.md).
+before that call ever left this process — re-verified against the actual Razorpay API in
+test mode, not just a stub, via `GET /debug/mcp` showing zero executed calls.
+
+That same live run found a real bug: Razorpay rejecting an amount came back through the MCP
+protocol as an ordinary-looking result, not a raised exception, because `razorpay_mcp/server.py`
+never set the protocol's own `isError` field on a tool-level failure -- so the gateway
+committed a reservation for a payment link that was never actually created, silently zeroing
+the invoice's real remaining budget. Fixed at the source (`razorpay_mcp/server.py` now sets
+`isError=True`; `MCPConnection.call()` now raises a dedicated `MCPToolError` for it, which the
+gateway releases and converts back to the same non-raising result the model already saw) and
+re-verified live: the failed call now releases correctly, and the budget stays usable. Full
+writeup, including the exact live sequence that surfaced it, in [EVALUATION.md](EVALUATION.md).
 
 A seventh adversary goal, `rail_abuse`, points the autonomous debtor at the same rail. Four
 runs, three framings: it never independently found the platform-native angle the manual

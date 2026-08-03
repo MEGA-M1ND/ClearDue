@@ -167,15 +167,30 @@ def build_server() -> Server:
         return TOOLS
 
     @server.call_tool()
-    async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[types.TextContent]:
+    async def _call_tool(
+        name: str, arguments: dict[str, Any] | None
+    ) -> list[types.TextContent] | types.CallToolResult:
         args = arguments or {}
         try:
             result = await asyncio.to_thread(_dispatch, name, args)
             text = json.dumps(result)
         except rest.RazorpayError as e:
             text = json.dumps({"error": str(e)})
+            # isError=True is the MCP protocol's own way to signal tool-level
+            # failure -- omitting it (as this server originally did) leaves a
+            # caller with no way to tell this apart from success without
+            # parsing the text for an "error" key. That distinction turned
+            # out to matter: mcp_gateway's obligation hook reserves budget
+            # BEFORE this call and must release it on failure, which it can
+            # only do if failure is actually signalled here, not just described.
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=text)], isError=True
+            )
         except KeyError as e:
             text = json.dumps({"error": f"missing required argument: {e}"})
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=text)], isError=True
+            )
         return [types.TextContent(type="text", text=text)]
 
     return server

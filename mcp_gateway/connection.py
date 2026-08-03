@@ -32,6 +32,18 @@ class MCPConnectionError(Exception):
     pass
 
 
+class MCPToolError(MCPConnectionError):
+    """The MCP call completed -- the transport worked -- but the tool itself
+    reported failure via the protocol's own `CallToolResult.isError` field
+    (Razorpay rejecting an amount, an unknown payment_link_id, and similar
+    ordinary business-logic errors, as opposed to a dead session or a
+    timeout). Callers that reserve budget before a call need this
+    distinction: a `MCPToolError` means nothing was actually accomplished
+    and any reservation must be released, exactly like a transport failure
+    -- but unlike one, it is an expected, routine outcome, not a sign the
+    session itself is broken."""
+
+
 class MCPConnection:
     """One MCP session, owned by a background thread, callable synchronously."""
 
@@ -141,7 +153,18 @@ class MCPConnection:
         return list(self._tools)
 
     def call(self, name: str, args: dict[str, Any]) -> str:
-        """Invoke an MCP tool and return its text content."""
+        """Invoke an MCP tool and return its text content.
+
+        Raises MCPToolError if the server marked its own result isError --
+        found live, the hard way: a server can return a perfectly normal
+        TextContent block describing a failure (Razorpay's real API
+        rejecting an amount) without raising anything at the transport
+        level at all. Silently returning that text as if it were a success
+        is indistinguishable from an actual success to any caller that
+        reserved budget before making this call -- checked here, once, so
+        every caller of this method gets the distinction for free rather
+        than having to parse tool-specific error shapes out of plain text.
+        """
         if self._session is None or self._loop is None:
             raise MCPConnectionError("session is not running; call start() first")
 
@@ -155,7 +178,11 @@ class MCPConnection:
             text = getattr(block, "text", None)
             if text is not None:
                 parts.append(text)
-        return "\n".join(parts) if parts else ""
+        text = "\n".join(parts) if parts else ""
+
+        if getattr(result, "isError", False):
+            raise MCPToolError(text or f"{name} failed with no error detail")
+        return text
 
     def __enter__(self) -> "MCPConnection":
         self.start()

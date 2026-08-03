@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from agent import mcp_obligation as mo  # noqa: E402
 from agent import obligation, session  # noqa: E402
 from agent.mcp_rules import apply_rules  # noqa: E402
-from mcp_gateway import PolicyGateway  # noqa: E402
+from mcp_gateway import MCPToolError, PolicyGateway  # noqa: E402
 from policy_engine.obligation_mapping import UnresolvedObligation  # noqa: E402
 
 
@@ -44,14 +44,21 @@ class _StubConnection:
         {"name": "fetch_payment", "description": "x", "inputSchema": {}},
     ]
 
-    def __init__(self, raise_on_call: bool = False):
+    def __init__(self, raise_on_call: bool = False, tool_error: bool = False):
         self.calls: list[tuple[str, dict]] = []
         self._raise = raise_on_call
+        self._tool_error = tool_error
 
     def call(self, name, args):
         self.calls.append((name, args))
         if self._raise:
             raise RuntimeError("simulated transport failure")
+        if self._tool_error:
+            # The exact shape of the live bug this regression test targets:
+            # the transport succeeds, the SERVER answers, but the answer
+            # itself is a business-logic failure signalled via isError --
+            # not a raised connection-level exception.
+            raise MCPToolError('{"error": "Razorpay returned 400: amount exceeds maximum amount allowed."}')
         return "plink_stub"
 
 
@@ -190,6 +197,41 @@ def test_transport_failure_releases_the_reservation():
 
     after = obligation.ledger.get_available_budget(invoice_id, outstanding)
     assert before == after
+
+
+def test_tool_level_failure_releases_and_does_not_raise():
+    """The exact bug this test was written to pin down, found live: Razorpay
+    rejecting an amount (HTTP 400) comes back through the MCP protocol as an
+    ordinary CallToolResult with isError=True, not a raised connection-level
+    exception. Before MCPConnection.call() checked isError, that failure was
+    silently indistinguishable from success -- PolicyGateway.call() would
+    commit() a reservation for a payment link that was never actually
+    created, permanently and wrongly shrinking every later call's available
+    budget on that invoice. Two things must both be true: the reservation is
+    released (not committed), and the caller gets back a normal text result,
+    not an exception -- an ordinary Razorpay-side rejection must not surface
+    three layers away as a Python exception.
+    """
+    invoice_id, outstanding = "INV1002", 120_000.0
+    before = obligation.ledger.get_available_budget(invoice_id, outstanding)
+
+    gw, conn = _gateway(tool_error=True)
+    decision = gw.call(
+        "create_payment_link", {"amount": 10_800_000}, state={"bound_invoice_id": invoice_id}
+    )
+
+    assert decision.allowed, "policy allowed this call; only the downstream tool failed"
+    assert "amount exceeds maximum" in decision.text
+    after = obligation.ledger.get_available_budget(invoice_id, outstanding)
+    assert before == after, "a reservation for a call that never actually succeeded must be released"
+
+    # And the budget must still be usable afterward -- the regression this
+    # guards against left it permanently consumed.
+    gw2, conn2 = _gateway()
+    decision2 = gw2.call(
+        "create_payment_link", {"amount": 5_000}, state={"bound_invoice_id": invoice_id}
+    )
+    assert decision2.allowed
 
 
 def test_guardrails_off_disables_cross_path_check_too():
