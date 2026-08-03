@@ -359,6 +359,16 @@ identical simulation with no session cookie present (a fresh, anonymous visitor)
 
 ## Known limitations
 
+- **The obligation ledger is ClearDue-native, not portable to Razorpay's real MCP tool
+  schema as-is.** Razorpay's actual payment-link/refund/settlement tools have no
+  `invoice_id` concept -- a link there is just an amount and a description -- so the
+  cross-tool stacking guard that closes Goal 7 has nothing to key against on the MCP
+  path without a schema-mapping layer this project doesn't build. `mcp_gateway/` still
+  guards that path with its own per-tool policies (`NumericBounds`, `WindowedBudget`,
+  `ToolAllowlist`); it just doesn't inherit the obligation ledger's cross-tool invariant.
+- **`/api/simulate` doesn't cover the obligation ledger either**, for the same reason --
+  see the Phase 5 writeup above for the live-verified example of where this diverges from
+  what the real tool would do.
 - **Webhook signature verification is untested against a real Razorpay-originated
   webhook** -- only against self-signed payloads built the same documented way, since
   triggering a genuine one requires dashboard access this environment doesn't have.
