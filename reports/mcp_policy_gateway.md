@@ -7,8 +7,10 @@ is real captured output, not reconstructed.*
 
 ## The gap
 
-Razorpay's MCP server exposes on the order of forty money-moving operations — payment
-links, orders, refunds, instant settlements — to any client holding a merchant token.
+Razorpay's MCP server exposes 35+ payment operations — payment links, orders, refunds,
+QR codes, settlements, payouts — to any client holding a merchant token, per Razorpay's
+own [tools reference](https://razorpay.com/docs/mcp-server/tools-reference/). Most of
+these move money or authorize something that will.
 The published blast-radius control is **availability**: three of the highest-risk tools
 (`create_refund`, `close_qr_code`, `create_instant_settlement`) are withheld from the
 hosted server and offered only on a self-hosted one.
@@ -288,7 +290,7 @@ to inspect the other three runs directly.)
 ## Honest limitations
 
 - **The stand-in server is not Razorpay's.** It speaks real MCP to the real REST API with
-  real credentials, but it implements eight tools, not forty, and it is my code. The
+  real credentials, but it implements eight tools, not 35+, and it is my code. The
   gateway is transport- and server-agnostic by construction, and switching to Razorpay's
   hosted server is one environment variable — but that switch has not been exercised,
   because it needs an interactive OAuth token.

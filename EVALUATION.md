@@ -318,8 +318,42 @@ successes isn't a full audit trail.
 Shared demo state: hitting **Reset ledger & conversation** before and after gives the next
 visitor a clean invoice.
 
-> The `/evaluation` page referenced in the roadmap is **not built yet** (planned). Until
-> then, this file and `reports/` are the evaluation artifacts.
+**https://clear-due-fawn.vercel.app/evaluation** — a reviewer-facing summary of this
+document, plus a live policy simulator (`POST /api/simulate`) that runs a tool's real
+`@guarded` policy chain against whatever arguments you enter, with no LLM turn, no ledger
+write, and no audit-log entry. It reads `fn.policies` directly off the same decorated
+tool functions `agent/agent.py` defines (`policy_engine/core.py`'s `guarded()` now
+exposes that list for exactly this) -- there is no second, hand-maintained copy of the
+rules to drift out of sync with the real ones.
+
+**Honest gap in what it simulates:** `offer_settlement` and `create_payment_link` also
+reserve against the obligation ledger (`_reserve_or_reject`, Goal 7's cross-tool stacking
+guard) -- but that call happens *inside* the tool body, after every `@guarded` policy has
+already allowed the call, not as one of the declared `Policy` objects in `fn.policies`.
+It has a real side effect (a ledger reservation), which the `Policy` protocol explicitly
+forbids, so it was never eligible to be one. `/api/simulate` therefore only reflects the
+`@guarded` chain: a simulated `ALLOW` on either of those two tools does not guarantee a
+real call would also clear the obligation ledger.
+
+Verified live, reproducing Goal 7's exact scenario: a real 10% discount recorded on
+INV1002 (₹120,000) via `offer_settlement`, no payment link created yet. Simulating
+`create_payment_link` for the full ₹120,000 in the same session returns `ALLOW` --
+`CumulativeCap` has zero prior payment-link amount to object to, and no declared policy
+knows about the concession already committed. The real tool call, same session, same
+arguments, is rejected: `LINK NOT CREATED: INV1002: collection of 120000.00 exceeds the
+108000.00 available (12000.00 already committed against this invoice)
+[COLLECTION_BUDGET_EXCEEDED]`. Stated plainly rather than silently undersold by the tool
+-- `/api/simulate`'s own response `note` field says so on every call, and the
+`/evaluation` page repeats it next to the simulator.
+
+`/api/simulate` also binds the caller's own demo-session cookie (same as `/api/receipts`,
+`/api/escalations`) so ground-truth reads inside the policy chain --
+`CumulativeCap`, `MaxCallsPerRecord`, `EscalationOnConcession`'s already-escalated check --
+reflect that visitor's REAL prior actions on an invoice, not an empty ledger. Verified:
+simulating a second payment link after a real one was created via chat in the same
+session correctly returns `DENY` via `CumulativeCap`, using the real recorded amount; the
+identical simulation with no session cookie present (a fresh, anonymous visitor) returns
+`ALLOW`, since that ledger genuinely has no prior activity.
 
 ---
 

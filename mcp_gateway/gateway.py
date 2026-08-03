@@ -1,9 +1,10 @@
 """A policy gateway for MCP tool calls.
 
 An MCP server hands an LLM a tool catalog it did not choose and cannot
-constrain. Razorpay's, for example, exposes on the order of forty
-money-moving operations -- payment links, orders, refunds, instant
-settlements -- to any client holding a merchant token. The only blast-radius
+constrain. Razorpay's, for example, exposes 35+ payment operations -- payment
+links, orders, refunds, QR codes, settlements, payouts -- to any client
+holding a merchant token (per Razorpay's own published tools reference),
+most of which move money or authorize something that will. The only blast-radius
 control published today is availability: three of the highest-risk tools
 (`create_refund`, `close_qr_code`, `create_instant_settlement`) are withheld
 from the hosted server and offered only on a self-hosted one. That is a

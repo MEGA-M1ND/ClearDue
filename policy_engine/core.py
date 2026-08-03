@@ -225,6 +225,13 @@ def guarded(
 
             return fn(*args, **kwargs)
 
+        # Exposes the ordered policy chain for introspection -- e.g.
+        # agent/simulate.py's dry-run endpoint, which needs to run these same
+        # checks against hypothetical arguments without executing `fn` or
+        # writing to the audit log. Read-only; nothing here calls .check()
+        # except the wrapper above and whatever introspects this list.
+        wrapper.policies = policies
+
         return wrapper
 
     return decorator

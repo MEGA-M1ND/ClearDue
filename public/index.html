@@ -306,6 +306,25 @@
   }
   #hero .hint b { color: var(--fg-dim); font-weight: 600; }
 
+  .techDetails { margin: 0 0 1.15rem; }
+  .techDetails summary {
+    cursor: pointer; font-size: .77rem; font-weight: 500; color: var(--fg-faint);
+    list-style: none; display: inline-flex; align-items: center; gap: .3rem;
+  }
+  .techDetails summary::-webkit-details-marker { display: none; }
+  .techDetails summary::before {
+    content: "▸"; display: inline-block; font-size: .68rem; transition: transform .15s;
+  }
+  .techDetails[open] summary::before { transform: rotate(90deg); }
+  .techDetails summary:hover { color: var(--fg-dim); }
+  .techGrid {
+    margin: .55rem 0 0; padding: .7rem .85rem; border-radius: 9px;
+    background: var(--surface); border: 1px solid var(--line);
+    display: grid; grid-template-columns: auto 1fr; gap: .3rem .8rem;
+  }
+  .techGrid dt { font-size: .72rem; color: var(--fg-faint); }
+  .techGrid dd { margin: 0; font-size: .72rem; font-family: var(--mono); color: var(--fg-dim); }
+
   /* ------------------------------------------------------------ run the proof */
 
   #proof { margin: 1.4rem 0 0; border-top: 1px solid var(--line); padding-top: 1.3rem; }
@@ -553,18 +572,30 @@
       <div class="streamInner" id="streamInner">
         <div id="hero">
           <p class="eyebrow">Autonomous red-teaming</p>
-          <h2>An AI talked this agent into <em id="statBig">₹90,000</em> of payment links against a <em>₹45,000</em> invoice.</h2>
+          <h2>ClearDue is the policy and audit layer for AI agents that move money.</h2>
           <p class="body">
-            Not a script — an LLM playing a debtor, probing on its own. Three links, each
-            individually under the invoice total, together double it. Found, fixed, reverified.
-            Every guardrail here is declared through <code>policy_engine</code>, a reusable module
-            of composable rules, and every decision it makes — allowed or denied — is logged.
+            An LLM playing a debtor, probing on its own, talked this agent into
+            <em id="statBig">₹90,000</em> of payment links against a <em>₹45,000</em> invoice —
+            three links, each individually under the invoice total, together double it. Found,
+            fixed, reverified. Every guardrail here is declared through <code>policy_engine</code>,
+            a reusable module of composable rules, and every decision it makes — allowed or
+            denied — is logged.
           </p>
           <div class="links">
             <a class="primary" href="https://github.com/MEGA-M1ND/ClearDue" target="_blank" rel="noopener">Source on GitHub</a>
             <a href="https://github.com/MEGA-M1ND/ClearDue/blob/main/reports/payment_link_overcollect_before_after.md" target="_blank" rel="noopener">The finding, before &amp; after</a>
+            <a href="/evaluation">Evaluation guide</a>
             <a href="https://github.com/MEGA-M1ND/PaySentry" target="_blank" rel="noopener">PaySentry</a>
           </div>
+          <details class="techDetails">
+            <summary>Technical details</summary>
+            <dl class="techGrid">
+              <dt>Agent model</dt><dd id="techModel">—</dd>
+              <dt>Framework</dt><dd>LangGraph (create_react_agent) + FastAPI</dd>
+              <dt>Storage</dt><dd id="techStorage">—</dd>
+              <dt>Payments</dt><dd>Razorpay Payment Links API, test mode</dd>
+            </dl>
+          </details>
           <section id="proof">
             <div class="proofHead">
               <h3>Run the proof</h3>
@@ -655,6 +686,7 @@ function restoreHero() {
   $("proofRunAll").onclick = runAllProof;
   $("proofResetBtn").onclick = resetProof;
   countUpStat();
+  refreshHealth();
 }
 
 /* Rejection detection.
@@ -1322,10 +1354,12 @@ async function refreshHealth() {
     const r = await fetch(BASE + "/health", { signal: AbortSignal.timeout(6000) });
     const d = await r.json();
     box.innerHTML =
-      `<span class="pill mono hideSm">${esc(d.model || "?")}</span>` +
       `<span class="pill ${d.guardrails === "on" ? "on" : "off"}">guardrails ${esc(d.guardrails)}</span>` +
       `<span class="pill ${d.authz === "on" ? "on" : "off"}">authz ${esc(d.authz)}</span>` +
       `<span class="pill hideSm"><span class="dot live"></span>${d.storage === "redis" ? "redis" : "in-memory"}</span>`;
+    const tm = $("techModel"), ts = $("techStorage");
+    if (tm) tm.textContent = d.model || "unknown";
+    if (ts) ts.textContent = d.storage === "redis" ? "Redis" : "in-memory";
   } catch (e) {
     box.innerHTML = `<span class="pill off"><span class="dot"></span>unreachable</span>`;
   }

@@ -28,6 +28,7 @@ from . import mock_ledger
 from . import razorpay_reconciler
 from . import session
 from . import rate_limit
+from . import simulate as simulate_module
 from . import store
 
 use_audit_backend(store)
@@ -45,6 +46,7 @@ app = FastAPI(title="ClearDue Collections Agent", version="0.1.0")
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UI_PATH = os.path.join(REPO_ROOT, "public", "index.html")
+EVALUATION_UI_PATH = os.path.join(REPO_ROOT, "public", "evaluation.html")
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,6 +63,17 @@ def ui() -> FileResponse:
     no build step, served directly by this app rather than a separate
     frontend project."""
     return FileResponse(UI_PATH)
+
+
+@app.get("/evaluation", include_in_schema=False)
+def evaluation_ui() -> FileResponse:
+    """Same static-file pattern as `/`: `public/evaluation.html` has no
+    extension in its URL, so on Vercel there is no matching static asset for
+    the bare `/evaluation` path and the request falls through to this
+    function (static files still take priority for anything that DOES match
+    a literal filename, same as `/` -- see the Vercel deployment notes in
+    README.md)."""
+    return FileResponse(EVALUATION_UI_PATH)
 
 
 class ChatRequest(BaseModel):
@@ -381,6 +394,47 @@ def reject_escalation(
     if case is None:
         raise HTTPException(status_code=404, detail=f"no case {case_id!r} in this session")
     return case
+
+
+# ---------------------------------------------------------------------------
+# Policy simulation -- Phase 5. Dry-runs a tool's real, live @guarded policy
+# chain against hypothetical arguments (agent/simulate.py), so a reviewer
+# can see exactly which guardrail would allow or deny a call, and why,
+# without spending an LLM turn and without it touching the ledger or the
+# real audit log.
+# ---------------------------------------------------------------------------
+
+
+class SimulateRequest(BaseModel):
+    tool: str
+    args: dict[str, Any] = {}
+    # What this HYPOTHETICAL session is bound to -- the same state
+    # SessionBound/ConsentRequired read for a real call. Lets a reviewer
+    # specifically test authz: does a call naming a DIFFERENT invoice than
+    # this get denied? Distinct from `args["invoice_id"]`, the call's own
+    # target, on purpose.
+    bound_invoice_id: str | None = None
+
+
+@app.get("/api/simulate/tools")
+def simulate_tools() -> dict[str, Any]:
+    return {"tools": simulate_module.available_tools()}
+
+
+@app.post("/api/simulate")
+def simulate_policy(req: SimulateRequest, request: Request, response: Response) -> dict[str, Any]:
+    # Ground-truth reads inside the policy chain (CumulativeCap, MaxCallsPerRecord,
+    # EscalationOnConcession's already-escalated check, ...) read mock_ledger's
+    # per-session action log -- binding the caller's own demo-session cookie here
+    # means a simulation reflects what THIS visitor's own chat history already did
+    # on an invoice, not an empty, anonymous ledger. `bound_invoice_id` stays a
+    # separate, explicit override (see SimulateRequest) for deliberately testing
+    # the authz mismatch case.
+    session.bind(request, response)
+    try:
+        return simulate_module.simulate(req.tool, req.args, req.bound_invoice_id)
+    except simulate_module.UnknownToolError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # ---------------------------------------------------------------------------

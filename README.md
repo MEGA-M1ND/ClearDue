@@ -10,6 +10,9 @@ proving they hold as the agent changes?
 
 **Evaluating this?** Start with [EVALUATION.md](EVALUATION.md) — reproducible commands,
 the seven evaluation goals with honest build status, and the before/after red-team numbers.
+Or open [**/evaluation**](https://clear-due-fawn.vercel.app/evaluation) on the live
+deployment for a reviewer-facing summary, including a live policy simulator that runs
+the real guardrails against arguments you enter, with no LLM turn and no ledger write.
 
 | Phase | Status |
 |---|---|
@@ -17,7 +20,7 @@ the seven evaluation goals with honest build status, and the before/after red-te
 | 2 — Obligation ledger (cross-tool stacking) | ✅ done |
 | 3 — Merchant policy profiles + versioned decisions | ✅ done |
 | 4 — Razorpay webhook reconciliation | ✅ done |
-| 5 — Evaluation page + policy simulation | ⬜ not started |
+| 5 — Evaluation page + policy simulation | ✅ done |
 
 ---
 
@@ -268,6 +271,21 @@ since the on-demand check already covers the no-webhook case. Full writeup, incl
 this does *not* touch `obligation_ledger.commit()` (that already fires at link-creation,
 a genuinely different event from payment confirmation), is in [EVALUATION.md](EVALUATION.md).
 
+### A live policy simulator, not a second copy of the rules
+
+[`/evaluation`](https://clear-due-fawn.vercel.app/evaluation) adds a reviewer-facing
+summary page plus `POST /api/simulate`, which dry-runs a tool's real `@guarded` policy
+chain against arguments you supply -- no LLM turn, no ledger write, no audit-log entry.
+The load-bearing detail: it does not reimplement any rule. `policy_engine/core.py`'s
+`guarded()` now attaches the ordered `Policy` list it wraps a tool with as `fn.policies`,
+and `agent/simulate.py` reads that list straight off the live `agent.py` tool objects
+(`tool.func.policies`) -- if a policy is ever added, removed, or reordered on a real tool,
+the simulator reflects it on its very next call with nothing to keep in sync by hand.
+Honestly scoped, not oversold: `offer_settlement`/`create_payment_link` also reserve
+against the obligation ledger as a step *inside* the tool body (a real side effect, which
+the `Policy` protocol forbids, so it was never one of the declared policies) -- the
+simulator does not check that, and says so. Full writeup in [EVALUATION.md](EVALUATION.md).
+
 ---
 
 ## Repository layout
@@ -278,9 +296,9 @@ agent/
                      the per-session overlay so two visitors see their own ledger
   agent.py           LangGraph agent, 8 tools, all guardrails declared via policy_engine,
                      resolved LIVE from merchant_policy_store on every check
-  server.py          FastAPI: /, /chat, /health, /debug/*, /api/reset, /api/policy,
-                     /api/receipts, /api/escalations, /api/webhooks/razorpay,
-                     /api/reconciliation
+  server.py          FastAPI: /, /evaluation, /chat, /health, /debug/*, /api/reset,
+                     /api/policy, /api/receipts, /api/escalations, /api/simulate,
+                     /api/webhooks/razorpay, /api/reconciliation
   session.py         the httpOnly demo-session cookie every request is scoped by
   store.py           Redis (or in-memory) storage, every key namespaced per session --
                      except merchant policy, deliberately global (see merchant_policy_store.py)
@@ -290,6 +308,8 @@ agent/
   razorpay_client.py  real Razorpay Payment Links API -- create + get-status
   razorpay_reconciler.py  webhook verification, payment confirmation, global link-owner
                      reverse index, single on-demand status check
+  simulate.py         dry-runs a tool's real @guarded policy chain against hypothetical
+                     args -- no LLM turn, no ledger write, no audit-log entry
   run_agent.py       entry point
   manual_test.py     benign sanity check
 
@@ -321,6 +341,7 @@ adversary/
 
 public/
   index.html          chat UI -- scenario stepper, invoice picker, two-tab log panel
+  evaluation.html     reviewer summary + a live policy simulator, served at /evaluation
 
 reports/
   discovery_results.json                        generated, gitignored
@@ -332,8 +353,9 @@ reports/
 
 ## The MCP policy gateway
 
-Razorpay's MCP server hands an LLM roughly forty money-moving operations — payment links,
-orders, refunds, instant settlements — to any client holding a merchant token. The
+Razorpay's MCP server hands an LLM [35+ payment operations](https://razorpay.com/docs/mcp-server/tools-reference/)
+— payment links, orders, refunds, QR codes, settlements, payouts — to any client holding
+a merchant token, most of which move money or authorize something that will. The
 published blast-radius control is *availability*: three of the riskiest tools
 (`create_refund`, `close_qr_code`, `create_instant_settlement`) are withheld from the
 hosted server and offered only on a self-hosted one. One bit per tool, fixed at deployment,
