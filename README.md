@@ -416,14 +416,17 @@ served it directly and the Python function never ran).
 That same fact broke `/evaluation` (Phase 5) the moment it shipped: `public/evaluation.html`
 has no bare-path static match, so the request correctly falls through to the function --
 but `@app.get("/evaluation")`'s `FileResponse` then 500'd in production, because Vercel's
-Python builder does not bundle a `public/`-style asset directory into the function's own
-filesystem by default; it only exists for the separate static-hosting layer that serves
-literal filename matches. `vercel.json`'s `functions.api/index.py.includeFiles: "public/**"`
-fixes it by explicitly telling the builder to copy that directory into the Lambda too.
-Caught live on the actual deployment (not locally, where there's no such split) and fixed
-the same day -- worth flagging because the exact same `FileResponse(UI_PATH)` pattern
-backing `/` was silently never exercised in production before this, masked by static files
-always winning first.
+Python builder does not reliably put a `public/`-style asset directory on the function's
+own filesystem the way `/`'s (never actually exercised in production, since the static
+layer resolves `/` first -- confirmed via `X-Vercel-Cache: HIT` on the live deployment)
+`FileResponse(UI_PATH)` assumes. Tried `functions.api/index.py.includeFiles: "public/**"`
+in `vercel.json` first; verified live it did **not** fix the 500. `public/evaluation.html`
+itself, at its literal filename `/evaluation.html`, **was** already being served correctly
+by the static layer the whole time (also confirmed via `X-Vercel-Cache: HIT`) -- so the fix
+that actually worked was simpler: `evaluation_ui()` now checks whether the file exists on
+the function's own filesystem and serves it directly if so (true locally), and redirects to
+the proven-working static URL otherwise (true on Vercel). Correct in both places without
+depending on a builder-bundling behavior that turned out not to hold.
 
 The one thing that has to change for a serverless deployment: `SESSIONS`,
 `SESSION_INVOICE`, `mock_ledger.action_log`, and `policy_engine.audit_log` all used to be

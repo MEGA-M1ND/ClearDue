@@ -15,7 +15,7 @@ from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 
 from policy_engine.core import list_audit_log, use_audit_backend, use_receipt_context
@@ -66,14 +66,23 @@ def ui() -> FileResponse:
 
 
 @app.get("/evaluation", include_in_schema=False)
-def evaluation_ui() -> FileResponse:
-    """Same static-file pattern as `/`: `public/evaluation.html` has no
-    extension in its URL, so on Vercel there is no matching static asset for
-    the bare `/evaluation` path and the request falls through to this
-    function (static files still take priority for anything that DOES match
-    a literal filename, same as `/` -- see the Vercel deployment notes in
-    README.md)."""
-    return FileResponse(EVALUATION_UI_PATH)
+def evaluation_ui() -> Response:
+    """`public/evaluation.html` has no bare-path static match on Vercel (only
+    literal filenames like `/evaluation.html` are served by the static
+    layer), so `/evaluation` falls through to this function -- and found,
+    live, that Vercel's Python builder does not reliably put `public/` on
+    the function's OWN filesystem the way `/`'s FileResponse assumes (that
+    route never actually gets exercised in production, since `/` itself is
+    resolved by the static layer before the function ever runs -- confirmed
+    via `X-Vercel-Cache: HIT` on the live deployment). `/evaluation.html`
+    itself, the literal filename, IS reliably served by that same static
+    layer. Rather than depend on the function's filesystem having the file
+    (`includeFiles` in vercel.json was tried first; it did not fix this),
+    check locally and redirect to the proven-working static URL otherwise --
+    correct either way this ever runs, on Vercel or off it."""
+    if os.path.exists(EVALUATION_UI_PATH):
+        return FileResponse(EVALUATION_UI_PATH)
+    return RedirectResponse(url="/evaluation.html")
 
 
 class ChatRequest(BaseModel):
