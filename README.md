@@ -313,6 +313,9 @@ agent/
                      reverse index, single on-demand status check
   simulate.py         dry-runs a tool's real @guarded policy chain against hypothetical
                      args -- no LLM turn, no ledger write, no audit-log entry
+  mcp_obligation.py   resolves an MCP call onto ClearDue's obligation ledger -- which
+                     invoice, priced how, converted from paise -- so a native concession
+                     and a real Razorpay payment link draw against the same budget
   run_agent.py       entry point
   manual_test.py     benign sanity check
 
@@ -321,12 +324,15 @@ policy_engine/
                          decision receipts (both via the same pluggable backend)
   policies.py           reusable Policy classes -- no ClearDue-specific imports
   obligation_ledger.py  cross-tool invariant (reserve/commit/release), transport-free
+  obligation_mapping.py resolves a FOREIGN tool call onto an obligation the ledger can
+                         guard -- transport- and domain-free, for any tool schema
   merchant_policy.py    versioned, editable MerchantPolicy -- transport-free
   decision_receipt.py   PolicyDecisionReceipt shape + fingerprinting -- transport-free
 
 mcp_gateway/
   connection.py      one long-lived MCP session, callable synchronously
-  gateway.py         intercepts every tools/call, enforces policy pre-execution
+  gateway.py         intercepts every tools/call, enforces policy pre-execution, and (if
+                     an ObligationHook is configured) reserves/commits/releases around it
   langchain_tools.py generates LangChain tools from the server's own schemas
 
 razorpay_mcp/
@@ -340,7 +346,9 @@ adversary/
   debtor_agent.py     the LLM debtor: strategy selection, turn generation, failure summaries
   orchestrator.py     runs the 2-level adaptive search, writes reports/discovery_results.json
   tests/
-    test_obligation_stacking.py   obligation ledger regression suite (pytest)
+    test_obligation_stacking.py       obligation ledger regression suite (pytest)
+    test_mcp_obligation_mapping.py    cross-path stacking (native + real MCP rail),
+                                       fail-closed resolution, transport-failure rollback
 
 public/
   index.html          chat UI -- scenario stepper, invoice picker, two-tab log panel
@@ -387,6 +395,19 @@ In a live `gpt-5.2` negotiation the model *was* successfully social-engineered i
 attempting a ₹50,000 instant settlement — and the gateway blocked it, with no
 corresponding receipt. The model can be talked into it; the gateway is what makes that not
 matter.
+
+### It now shares a budget with the native tools, not just its own per-tool caps
+
+The rules above are all per-tool: an amount ceiling, a rolling window. None of them know
+that a discount ClearDue's own `offer_settlement` just committed exists at all — because
+Razorpay's real `create_payment_link` schema is just `{amount, currency, description}`,
+with nothing to key a per-invoice check against. `gateway.configure()` now also accepts an
+`obligation` hook (`agent/mcp_obligation.py`), which resolves an MCP call onto ClearDue's
+own obligation ledger via the session's injected invoice binding — the same binding the
+model can't see or spoof — and reserves against it exactly like the native tools do,
+before the transport call, releasing on failure. A 10% discount committed natively, then a
+full-value link attempted on the real Razorpay rail: denied, `COLLECTION_BUDGET_EXCEEDED`,
+before that call ever left this process. Full writeup in [EVALUATION.md](EVALUATION.md).
 
 A seventh adversary goal, `rail_abuse`, points the autonomous debtor at the same rail. Four
 runs, three framings: it never independently found the platform-native angle the manual
@@ -473,25 +494,23 @@ runtime, not before.
 
 ## What's not done
 
-Stated plainly, same discipline as PaySentry. (Three items that used to be listed here --
+Stated plainly, same discipline as PaySentry. (Four items that used to be listed here --
 no cross-tool concession stacking, no real payment verification, one hardcoded merchant
-policy -- are gone from this list because Phases 2-4 specifically closed them; see the
+policy, and the obligation ledger not reaching the real MCP rail -- are gone from this
+list because Phases 2-4 and the MCP obligation resolver specifically closed them; see the
 sections above. This list is the CURRENT state, kept in sync with
 [EVALUATION.md § Known limitations](EVALUATION.md#known-limitations), which is the
 authoritative, more detailed version.)
 
-- **`policy_engine`'s obligation ledger is ClearDue-native, not portable to Razorpay's
-  real MCP tool schema as-is.** Razorpay's actual payment-link/refund/settlement tools
-  have no `invoice_id` concept -- a link there is just an amount and a description -- so
-  the cross-tool stacking guard that closes Goal 7 has nothing to key against on that
-  path without a schema-mapping layer this project doesn't build. `mcp_gateway/` still
-  guards the MCP path with per-tool policies (`NumericBounds`, `WindowedBudget`,
-  `ToolAllowlist`); it just doesn't get the obligation ledger's cross-tool invariant.
-- **`/api/simulate`'s dry run doesn't cover the obligation ledger.** `offer_settlement`/
-  `create_payment_link` reserve against it as a step inside the tool body, not as a
-  declared `Policy`, so a simulated `ALLOW` on either tool doesn't guarantee the real
-  obligation-ledger check would also pass -- verified live, and the simulator's own
-  response says so on every call.
+- **The MCP obligation resolver only maps `create_payment_link`** -- the one money-moving
+  tool ClearDue's own MCP allowlist permits at all -- and its no-session-binding fallback
+  only recognizes ClearDue's own payment-link description convention. See "The obligation
+  ledger now also guards the real Razorpay MCP rail" above.
+- **`/api/simulate`'s dry run doesn't cover the obligation ledger on the native tool
+  path.** `offer_settlement`/`create_payment_link` reserve against it as a step inside the
+  tool body, not as a declared `Policy`, so a simulated `ALLOW` on either tool doesn't
+  guarantee the real obligation-ledger check would also pass -- verified live, and the
+  simulator's own response says so on every call.
 - **Webhook signature verification is untested against a real Razorpay-originated
   webhook** -- only self-signed payloads built the same documented way.
 - **Genuine multi-tenancy doesn't exist.** `MerchantPolicy` is real, versioned, and live,

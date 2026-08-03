@@ -29,11 +29,50 @@ from __future__ import annotations
 import fnmatch
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from policy_engine.core import Policy, PolicyContext, PolicyResult, record_decision
 
 from .connection import MCPConnection
+
+
+@dataclass
+class ObligationOutcome:
+    """What an ObligationHook.reserve() reports back.
+
+    Three distinct states, deliberately not collapsed into two:
+      - handle=None, rejection=None -> this call draws against no budget
+        (a read-only lookup); proceed, nothing to commit or release.
+      - handle set                  -> budget claimed; the gateway now owes
+        exactly one commit() or release().
+      - rejection set               -> denied; the transport is never touched.
+    """
+
+    handle: Any | None = None
+    rejection: str | None = None
+    reason_code: str | None = None
+
+
+class ObligationHook(Protocol):
+    """A two-phase claim on shared budget, wrapped around the transport call.
+
+    Deliberately NOT a Policy. The Policy protocol forbids side effects --
+    policies decide, they never change state -- and reserving budget is a
+    real write that has to be undone if the call it authorized then fails.
+    Forcing it into a Policy would either break that contract or leak
+    reservations on every transport error.
+
+    Kept duck-typed and optional so mcp_gateway/ stays ignorant of what the
+    budget actually is: this module never imports an obligation ledger, and
+    a gateway constructed without a hook behaves exactly as it did before
+    this existed.
+    """
+
+    def reserve(
+        self, tool_name: str, args: dict[str, Any], state: dict[str, Any]
+    ) -> ObligationOutcome: ...
+    def commit(self, handle: Any) -> None: ...
+    def release(self, handle: Any) -> None: ...
 
 
 @dataclass
@@ -75,12 +114,14 @@ class PolicyGateway:
         global_policies: list[Policy] | None = None,
         rejection_prefix: str = "BLOCKED BY POLICY",
         amount_field: str = "amount",
+        obligation: ObligationHook | None = None,
     ):
         self._conn = connection
         self._rules = rules or []
         self._global = global_policies or []
         self._prefix = rejection_prefix
         self._amount_field = amount_field
+        self._obligation = obligation
         # Executed calls only. Denied calls are deliberately excluded: a
         # budget must measure what actually happened, and counting blocked
         # attempts against it would let a caller exhaust an agent's own
@@ -93,6 +134,7 @@ class PolicyGateway:
         self,
         rules: list[ToolRule] | None = None,
         global_policies: list[Policy] | None = None,
+        obligation: ObligationHook | None = None,
     ) -> "PolicyGateway":
         """Set rules after construction.
 
@@ -104,6 +146,8 @@ class PolicyGateway:
             self._rules = rules
         if global_policies is not None:
             self._global = global_policies
+        if obligation is not None:
+            self._obligation = obligation
         return self
 
     # -- introspection -----------------------------------------------------
@@ -155,8 +199,48 @@ class PolicyGateway:
                     receipt_id=receipt.receipt_id,
                 )
 
-        # Every policy allowed. Only now does anything touch the transport.
-        text = self._conn.call(tool_name, args)
+        # Every declared policy allowed. Now claim shared budget, if this
+        # gateway has an obligation hook -- AFTER the policies, matching the
+        # order agent/agent.py's native tools use (cheap declarative checks
+        # first; don't reserve budget for a call an allowlist would have
+        # rejected anyway).
+        handle = None
+        if self._obligation is not None:
+            outcome = self._obligation.reserve(tool_name, args, state or {})
+            if outcome.rejection is not None:
+                result = PolicyResult.deny(outcome.rejection, error_code=outcome.reason_code)
+                receipt = record_decision(
+                    f"mcp:{tool_name}", args, result, "ObligationLedger"
+                )
+                return GatewayDecision(
+                    allowed=False,
+                    tool=tool_name,
+                    args=args,
+                    text=f"{self._prefix}: {outcome.rejection}",
+                    reason=outcome.rejection,
+                    policy="ObligationLedger",
+                    error_code=outcome.reason_code,
+                    receipt_id=receipt.receipt_id,
+                )
+            handle = outcome.handle
+            if handle is not None:
+                record_decision(
+                    f"mcp:{tool_name}", args, PolicyResult.allow(), "ObligationLedger"
+                )
+
+        # Only now does anything touch the transport.
+        try:
+            text = self._conn.call(tool_name, args)
+        except Exception:
+            # The reservation outlived the call it was authorizing. Give the
+            # budget back rather than leaving this record's exposure
+            # permanently inflated by a call that never happened.
+            if handle is not None:
+                self._obligation.release(handle)
+            raise
+        if handle is not None:
+            self._obligation.commit(handle)
+
         exec_receipt = record_decision(
             f"mcp:{tool_name}",
             args,

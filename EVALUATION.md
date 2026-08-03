@@ -110,6 +110,58 @@ race-safety test that fires three concurrent reservations at 60% of an invoice e
 asserts exactly one succeeds, verified against real threads with the same context-propagation
 pattern LangGraph's own tool-calling engine uses (not assumed).
 
+### The obligation ledger now also guards the real Razorpay MCP rail
+
+The paragraph above explains why Goal 7's fix was wired into the native tools and
+deliberately **not** into `mcp_gateway/gateway.py` — Razorpay's real MCP `create_payment_link`
+has no `invoice_id` argument to key a per-invoice ledger against. That was true and stayed
+true: `obligation_ledger.py` was never touched. What closed instead is the missing piece —
+a resolver that determines which invoice an MCP call draws against and how much it's worth,
+so the SAME ledger can be asked the SAME question about a call that never mentions an invoice
+at all.
+
+`policy_engine/obligation_mapping.py` (transport- and ClearDue-agnostic, matching every other
+`policy_engine/` module) declares which tools consume budget via an fnmatch pattern, and calls
+two caller-supplied functions to resolve WHICH record and WHAT it's worth. `agent/mcp_obligation.py`
+is where ClearDue answers both: the record id comes from the session's `bound_invoice_id` —
+already riding into the gateway as `InjectedState` for `mcp_gateway/langchain_tools.py`'s own
+reasons — never from a model-writable argument, so the resolution can't be spoofed the same
+way `SessionBound` can't be spoofed on the native path. `mcp_gateway/gateway.py` gained an
+optional `ObligationHook` (reserve before the transport call, commit after success, release on
+failure — the identical two-phase shape `_reserve_or_reject` already used) that is `None` unless
+a caller wires one in; the gateway itself still imports nothing about invoices or ledgers.
+
+**Fail-closed, not fail-open, on the genuinely new failure mode this introduces**: an MCP
+`create_payment_link` call whose invoice can't be resolved (no session binding, no
+ClearDue-authored description to fall back to) is now **denied** with `OBLIGATION_UNRESOLVED`,
+never silently allowed through unattributed. An unattributable real payment link is exactly the
+un-auditable outcome this whole project exists to prevent — the same reasoning that makes
+`POST /api/webhooks/razorpay` refuse an unsigned payload outright rather than degrade gracefully.
+
+Verified live, over the real gateway (stub transport, so a denial's absence of a transport call
+is checkable the same way the bundled `razorpay_mcp` receipt log proves it for a real one):
+a 10% discount committed via native `offer_settlement` on a ₹120,000 invoice, followed by an
+MCP `create_payment_link` for the full ₹120,000 (12,000,000 paise) — denied,
+`COLLECTION_BUDGET_EXCEEDED`, `108,000.00` available, **zero calls reached the stub transport**.
+The correctly-discounted ₹108,000 link, same session, succeeds and commits. A read-only
+`fetch_payment` call is confirmed to never touch the ledger at all. A simulated transport
+failure after a successful reservation correctly releases the budget back (the MCP path's own
+version of the reserve-before-execute payoff `create_payment_link`'s real-Razorpay branch
+already relied on). `CLEARDUE_GUARDRAILS=off` correctly disables this check too, not just the
+native-tool ones — the demo's off-switch has to reproduce the real failure mode on every path
+uniformly or it's misrepresenting what "off" means. Full regression suite:
+`adversary/tests/test_mcp_obligation_mapping.py` (11 tests, no live server or MCP subprocess
+required — the gateway is exercised directly against a stub transport).
+
+**Honest scope limit, stated plainly:** only `create_payment_link` is mapped — the one
+money-moving tool ClearDue's own MCP allowlist (`agent/mcp_rules.py`) permits at all; refunds
+and settlements are denied by that allowlist before an obligation check would ever run, and
+`create_order` isn't allowlisted either, so specifying it here would claim coverage never
+exercised. The description-based fallback only recognizes ClearDue's own
+`"ClearDue collections -- {invoice_id}"` convention (`agent/razorpay_client.py`) — a payment
+link created with a different description, by a different caller of the same MCP server,
+would correctly fail closed rather than silently guess.
+
 ### Merchant policy is now live, editable, and versioned
 
 Before this, every threshold a tool enforced — discount cap, installment count,
@@ -359,16 +411,21 @@ identical simulation with no session cookie present (a fresh, anonymous visitor)
 
 ## Known limitations
 
-- **The obligation ledger is ClearDue-native, not portable to Razorpay's real MCP tool
-  schema as-is.** Razorpay's actual payment-link/refund/settlement tools have no
-  `invoice_id` concept -- a link there is just an amount and a description -- so the
-  cross-tool stacking guard that closes Goal 7 has nothing to key against on the MCP
-  path without a schema-mapping layer this project doesn't build. `mcp_gateway/` still
-  guards that path with its own per-tool policies (`NumericBounds`, `WindowedBudget`,
-  `ToolAllowlist`); it just doesn't inherit the obligation ledger's cross-tool invariant.
-- **`/api/simulate` doesn't cover the obligation ledger either**, for the same reason --
-  see the Phase 5 writeup above for the live-verified example of where this diverges from
-  what the real tool would do.
+- **The MCP obligation resolver only maps `create_payment_link`.** ClearDue's own MCP
+  allowlist (`agent/mcp_rules.py`) never permits refunds or settlements at all, and
+  `create_order` isn't allowlisted either -- mapping either would claim coverage never
+  exercised. See "The obligation ledger now also guards the real Razorpay MCP rail" above.
+- **The MCP resolver's description-based fallback only recognizes ClearDue's own
+  convention** (`"ClearDue collections -- {invoice_id}"`). It only matters when there's no
+  session binding at all; a real chat session always has one. A payment link created with a
+  different description by a different caller of the same MCP server correctly fails closed
+  (`OBLIGATION_UNRESOLVED`) rather than silently guessing.
+- **`/api/simulate` doesn't cover the obligation ledger on the NATIVE tool path.**
+  `offer_settlement`/`create_payment_link` reserve against it as a step inside the tool
+  body, not as a declared `Policy` -- see the Phase 5 writeup above for the live-verified
+  example of where a simulated `ALLOW` diverges from what the real tool would do. Unrelated
+  to the MCP resolver above; this is `agent/simulate.py` introspecting `fn.policies`, which
+  the ledger reservation was never part of on either path.
 - **Webhook signature verification is untested against a real Razorpay-originated
   webhook** -- only against self-signed payloads built the same documented way, since
   triggering a genuine one requires dashboard access this environment doesn't have.

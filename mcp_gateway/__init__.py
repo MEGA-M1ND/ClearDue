@@ -5,7 +5,13 @@ every `tools/call` before it reaches the transport. See gateway.py for why.
 """
 
 from .connection import MCPConnection, MCPConnectionError
-from .gateway import GatewayDecision, PolicyGateway, ToolRule
+from .gateway import (
+    GatewayDecision,
+    ObligationHook,
+    ObligationOutcome,
+    PolicyGateway,
+    ToolRule,
+)
 
 __all__ = [
     "MCPConnection",
@@ -13,4 +19,6 @@ __all__ = [
     "PolicyGateway",
     "ToolRule",
     "GatewayDecision",
+    "ObligationHook",
+    "ObligationOutcome",
 ]

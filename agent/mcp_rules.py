@@ -27,6 +27,8 @@ import os
 from mcp_gateway import PolicyGateway, ToolRule
 from policy_engine.policies import NumericBounds, ToolAllowlist, WindowedBudget
 
+from .mcp_obligation import hook as obligation_hook
+
 # Read-only lookups plus the one money-moving tool a collections agent has a
 # legitimate reason to call. Refunds and settlements are deliberately absent:
 # a receivables agent collects, it does not disburse, so there is no
@@ -56,8 +58,17 @@ def _guardrails_on() -> bool:
 
 
 def apply_rules(gateway: PolicyGateway) -> PolicyGateway:
-    """Attach ClearDue's rules to a gateway. Configures and returns it."""
+    """Attach ClearDue's rules to a gateway. Configures and returns it.
+
+    The `obligation` hook is what reconciles this rail against ClearDue's
+    OWN tools: a discount granted by the native `offer_settlement` and a
+    payment link created here draw against the same per-invoice budget, so
+    the two paths can no longer be played off against each other. Everything
+    above it is per-tool and per-call; this is the only cross-path check.
+    See agent/mcp_obligation.py.
+    """
     return gateway.configure(
+        obligation=obligation_hook,
         global_policies=[ToolAllowlist(allowed=ALLOWED_TOOLS, enabled=_guardrails_on)],
         rules=[
             ToolRule(
