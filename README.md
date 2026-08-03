@@ -409,7 +409,21 @@ path before it reached the app, while paths Vercel never rewrote (`/docs`, `/ope
 correctly reached FastAPI on their own. Vercel's zero-config routing for a lone
 `api/index.py` already sends any non-static path there with the real path intact --
 writing a rewrite for it actively made things worse. `/` still resolves to
-`public/index.html` because static files take priority over the function.
+`public/index.html` because static files take priority over the function -- confirmed by
+checking response headers on the live deployment (`X-Vercel-Cache: HIT`, meaning the edge
+served it directly and the Python function never ran).
+
+That same fact broke `/evaluation` (Phase 5) the moment it shipped: `public/evaluation.html`
+has no bare-path static match, so the request correctly falls through to the function --
+but `@app.get("/evaluation")`'s `FileResponse` then 500'd in production, because Vercel's
+Python builder does not bundle a `public/`-style asset directory into the function's own
+filesystem by default; it only exists for the separate static-hosting layer that serves
+literal filename matches. `vercel.json`'s `functions.api/index.py.includeFiles: "public/**"`
+fixes it by explicitly telling the builder to copy that directory into the Lambda too.
+Caught live on the actual deployment (not locally, where there's no such split) and fixed
+the same day -- worth flagging because the exact same `FileResponse(UI_PATH)` pattern
+backing `/` was silently never exercised in production before this, masked by static files
+always winning first.
 
 The one thing that has to change for a serverless deployment: `SESSIONS`,
 `SESSION_INVOICE`, `mock_ledger.action_log`, and `policy_engine.audit_log` all used to be
